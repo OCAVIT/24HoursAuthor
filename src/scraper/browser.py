@@ -1,4 +1,4 @@
-"""Playwright browser manager — singleton, прокси, UA ротация, случайные задержки."""
+"""Playwright browser manager — singleton, прокси, UA ротация, случайные задержки, антибан."""
 
 import asyncio
 import random
@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Locator
 
 from src.config import settings
 
@@ -117,6 +117,36 @@ class BrowserManager:
     async def short_delay(self) -> None:
         """Короткая задержка (1-3 сек) для переходов между страницами."""
         await asyncio.sleep(random.uniform(1.0, 3.0))
+
+    async def human_click(self, locator: Locator) -> None:
+        """Имитация человеческого клика: движение мыши к элементу + задержка перед кликом."""
+        if self._page is None:
+            return
+        try:
+            box = await locator.bounding_box()
+            if box:
+                # Случайная точка внутри элемента (не центр — так естественнее)
+                x = box["x"] + random.uniform(box["width"] * 0.2, box["width"] * 0.8)
+                y = box["y"] + random.uniform(box["height"] * 0.2, box["height"] * 0.8)
+                # Плавное движение мыши
+                await self._page.mouse.move(x, y, steps=random.randint(5, 15))
+                await asyncio.sleep(random.uniform(0.1, 0.4))
+                await self._page.mouse.click(x, y)
+            else:
+                await locator.click()
+        except Exception:
+            # Фоллбэк — обычный клик
+            await locator.click()
+
+    async def human_type(self, locator: Locator, text: str) -> None:
+        """Имитация человеческого набора текста — посимвольный ввод со случайными задержками."""
+        await locator.focus()
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        for char in text:
+            await locator.press_sequentially(char, delay=random.randint(30, 120))
+            # Иногда делать микропаузу (как человек думает)
+            if random.random() < 0.05:
+                await asyncio.sleep(random.uniform(0.3, 0.8))
 
     @property
     def page(self) -> Optional[Page]:

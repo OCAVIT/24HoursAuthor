@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import signal
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime
@@ -27,6 +28,10 @@ from src.database.crud import (
 )
 from src.notifications.events import push_notification
 from src.notifications.websocket import notification_manager, log_manager
+from src.scraper.antiban import (
+    is_banned, set_ban, clear_ban, get_ban_info,
+    check_page_for_ban, check_daily_bid_limit, MAX_DAILY_BIDS,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -41,10 +46,31 @@ scheduler = AsyncIOScheduler()
 # Флаг работы бота (можно остановить через дашборд)
 bot_running = True
 
+# Флаг для graceful shutdown — текущие задачи завершаются, новые не запускаются
+_shutting_down = False
+
+# Счётчик активных задач (для ожидания завершения при shutdown)
+_active_tasks = 0
+_active_tasks_lock = asyncio.Lock()
+
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
+
+async def _track_task():
+    """Инкрементировать счётчик активных задач."""
+    global _active_tasks
+    async with _active_tasks_lock:
+        _active_tasks += 1
+
+
+async def _untrack_task():
+    """Декрементировать счётчик активных задач."""
+    global _active_tasks
+    async with _active_tasks_lock:
+        _active_tasks = max(0, _active_tasks - 1)
+
 
 async def _log_action(action: str, details: str = "", order_id: int | None = None) -> None:
     """Записать действие в БД и отправить в WebSocket логов."""
@@ -85,7 +111,12 @@ async def _retry_async(coro_func, *args, max_retries: int = 3, **kwargs):
 
 async def scan_orders_job() -> None:
     """Сканировать новые заказы, оценить, поставить ставки."""
-    if not bot_running:
+    if not bot_running or _shutting_down:
+        return
+
+    # Проверка бана — если бан активен, не сканируем
+    if is_banned():
+        await _log_action("antiban", f"Скан пропущен: бан активен, осталось {ban_remaining_seconds()} сек")
         return
 
     from src.scraper.auth import login
@@ -99,10 +130,37 @@ async def scan_orders_job() -> None:
     from src.analyzer.file_analyzer import summarize_files
     from src.generator.router import is_supported
     from src.ai_client import chat_completion
+    from src.scraper.antiban import check_page_for_ban, ban_remaining_seconds
 
+    await _track_task()
     try:
         page = await _retry_async(login)
+
+        # Проверяем страницу на бан после логина
+        if await check_page_for_ban(page):
+            await _log_action("antiban", "Бан обнаружен после логина, пауза 30 мин")
+            async with async_session() as session:
+                await push_notification(
+                    session,
+                    type="error",
+                    title="Обнаружена блокировка",
+                    body={"error": get_ban_info()["reason"], "requires_attention": True},
+                )
+            return
+
         await _log_action("scan", "Начало сканирования заказов")
+
+        # Проверяем дневной лимит ставок
+        async with async_session() as session:
+            today_stats = await get_daily_stats(session, date.today())
+        bids_today = today_stats.bids_placed if today_stats else 0
+
+        if not await check_daily_bid_limit(bids_today):
+            await _log_action(
+                "antiban",
+                f"Дневной лимит ставок достигнут: {bids_today}/{MAX_DAILY_BIDS}",
+            )
+            return
 
         order_summaries = await _retry_async(fetch_order_list, page)
         if not order_summaries:
@@ -112,6 +170,18 @@ async def scan_orders_job() -> None:
         await _log_action("scan", f"Найдено {len(order_summaries)} заказов")
 
         for summary in order_summaries:
+            # Проверяем бан и shutdown на каждой итерации
+            if is_banned() or _shutting_down:
+                break
+
+            # Перепроверяем лимит после каждой ставки
+            async with async_session() as session:
+                today_stats = await get_daily_stats(session, date.today())
+            bids_today = today_stats.bids_placed if today_stats else 0
+            if not await check_daily_bid_limit(bids_today):
+                await _log_action("antiban", f"Лимит ставок ({MAX_DAILY_BIDS}) достигнут в процессе сканирования")
+                break
+
             try:
                 # Дедупликация по БД
                 async with async_session() as session:
@@ -290,6 +360,8 @@ async def scan_orders_job() -> None:
                 )
         except Exception:
             pass
+    finally:
+        await _untrack_task()
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +370,10 @@ async def scan_orders_job() -> None:
 
 async def process_accepted_orders_job() -> None:
     """Обработать принятые заказы: генерация → антиплагиат → доставка."""
-    if not bot_running:
+    if not bot_running or _shutting_down:
+        return
+
+    if is_banned():
         return
 
     from src.scraper.auth import login
@@ -307,6 +382,7 @@ async def process_accepted_orders_job() -> None:
     from src.generator.router import generate_and_check
     from src.docgen.builder import build_docx
 
+    await _track_task()
     try:
         # Получаем заказы в статусе 'accepted'
         async with async_session() as session:
@@ -510,6 +586,8 @@ async def process_accepted_orders_job() -> None:
     except Exception as e:
         logger.error("Критическая ошибка в process_accepted_orders_job: %s", e)
         await _log_action("error", f"Критическая ошибка обработки заказов: {e}")
+    finally:
+        await _untrack_task()
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +596,10 @@ async def process_accepted_orders_job() -> None:
 
 async def chat_responder_job() -> None:
     """Проверить новые сообщения от заказчиков и ответить через AI."""
-    if not bot_running:
+    if not bot_running or _shutting_down:
+        return
+
+    if is_banned():
         return
 
     from src.scraper.auth import login
@@ -526,6 +607,7 @@ async def chat_responder_job() -> None:
     from src.scraper.browser import browser_manager
     from src.chat_ai.responder import generate_response
 
+    await _track_task()
     try:
         page = await _retry_async(login)
 
@@ -641,6 +723,8 @@ async def chat_responder_job() -> None:
     except Exception as e:
         logger.error("Критическая ошибка в chat_responder_job: %s", e)
         await _log_action("error", f"Критическая ошибка чат-респондера: {e}")
+    finally:
+        await _untrack_task()
 
 
 # ---------------------------------------------------------------------------
@@ -685,12 +769,16 @@ async def daily_summary_job() -> None:
 
 async def check_accepted_bids_job() -> None:
     """Проверить, приняли ли заказчики наши ставки (перевод bid_placed → accepted)."""
-    if not bot_running:
+    if not bot_running or _shutting_down:
+        return
+
+    if is_banned():
         return
 
     from src.scraper.auth import login
     from src.scraper.browser import browser_manager
 
+    await _track_task()
     try:
         page = await _retry_async(login)
 
@@ -757,6 +845,8 @@ async def check_accepted_bids_job() -> None:
     except Exception as e:
         logger.error("Ошибка проверки принятых заказов: %s", e)
         await _log_action("error", f"Ошибка проверки принятых ставок: {e}")
+    finally:
+        await _untrack_task()
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +855,9 @@ async def check_accepted_bids_job() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Жизненный цикл приложения — запуск APScheduler."""
+    """Жизненный цикл приложения — запуск APScheduler + graceful shutdown."""
+    global _shutting_down
+
     # Запуск планировщика
     scheduler.add_job(
         scan_orders_job,
@@ -814,9 +906,33 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Остановка
+    # Graceful shutdown: сигнализируем задачам о завершении
+    _shutting_down = True
+    logger.info("Начинается graceful shutdown...")
+    await _log_action("system", "Graceful shutdown: ожидание завершения текущих задач")
+
+    # Останавливаем планировщик (новые задачи не запустятся)
     scheduler.shutdown(wait=False)
-    logger.info("APScheduler остановлен")
+
+    # Ждём завершения текущих задач (до 60 секунд)
+    shutdown_deadline = time.time() + 60
+    while _active_tasks > 0 and time.time() < shutdown_deadline:
+        logger.info("Ожидание завершения %d задач...", _active_tasks)
+        await asyncio.sleep(2)
+
+    if _active_tasks > 0:
+        logger.warning("Принудительная остановка: %d задач не завершились за 60 сек", _active_tasks)
+    else:
+        logger.info("Все задачи завершены корректно")
+
+    # Закрываем браузер
+    try:
+        from src.scraper.browser import browser_manager
+        await browser_manager.close()
+    except Exception:
+        pass
+
+    logger.info("Бот остановлен")
     await _log_action("system", "Бот остановлен")
 
 
@@ -841,6 +957,9 @@ async def health():
         "uptime": uptime,
         "bot_running": bot_running,
         "scheduler_jobs": jobs,
+        "ban_info": get_ban_info(),
+        "active_tasks": _active_tasks,
+        "shutting_down": _shutting_down,
     }
 
 
