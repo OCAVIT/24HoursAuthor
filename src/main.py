@@ -11,6 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import RedirectResponse
 
 from src.config import settings
 from src.database.connection import async_session
@@ -946,6 +947,12 @@ app.include_router(dashboard_router)
 # ---------------------------------------------------------------------------
 # HTTP и WebSocket эндпоинты
 # ---------------------------------------------------------------------------
+
+@app.get("/")
+async def root():
+    """Редирект на дашборд."""
+    return RedirectResponse(url="/dashboard/")
+
 
 @app.get("/health")
 async def health():
