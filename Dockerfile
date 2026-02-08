@@ -5,20 +5,20 @@ WORKDIR /app
 # Системные зависимости + Node.js для docx-js
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs \
     chromium fonts-liberation libatk-bridge2.0-0 \
     libatk1.0-0 libcups2 libdrm2 libgbm1 libgtk-3-0 libnss3 libxcomposite1 \
     libxdamage1 libxrandr2 xdg-utils && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Playwright
-ENV PLAYWRIGHT_BROWSERS_PATH=/browsers
-RUN pip install playwright && playwright install chromium
-
 # Зависимости Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Playwright браузер (после pip install, чтобы версия совпадала)
+ENV PLAYWRIGHT_BROWSERS_PATH=/browsers
+RUN playwright install chromium
 
 # Зависимости Node.js
 COPY package.json .
