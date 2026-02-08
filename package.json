@@ -1,0 +1,8 @@
+{
+  "name": "avtor24-docx",
+  "version": "1.0.0",
+  "description": "DOCX generation for Avtor24 bot",
+  "dependencies": {
+    "docx": "^8.5.0"
+  }
+}
