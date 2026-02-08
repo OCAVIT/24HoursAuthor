@@ -822,6 +822,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Avtor24 Bot", lifespan=lifespan)
 
+# Подключаем роутер дашборда
+from src.dashboard.app import router as dashboard_router
+app.include_router(dashboard_router)
+
 
 # ---------------------------------------------------------------------------
 # HTTP и WebSocket эндпоинты
