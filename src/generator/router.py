@@ -6,7 +6,7 @@ from typing import Optional, Callable, Awaitable
 from src.generator import (
     essay, referat, coursework, diploma, homework,
     presentation, translation, copywriting, business_plan,
-    practice_report, review, uniqueness,
+    practice_report, review, uniqueness, code_task,
 )
 from src.generator.essay import GenerationResult
 from src.antiplagiat.checker import check_uniqueness, CheckResult
@@ -78,8 +78,8 @@ GENERATORS: dict[str, Optional[GeneratorFunc]] = {
     "Вычитка и рецензирование работ": review.generate,
     "Проверка работы": review.generate,
 
-    # Задачи по программированию (Этап 6 — sandbox)
-    "Задача по программированию": None,
+    # Задачи по программированию
+    "Задача по программированию": code_task.generate,
 
     # Не поддерживаемые (реалтайм)
     "Онлайн-консультация": None,
