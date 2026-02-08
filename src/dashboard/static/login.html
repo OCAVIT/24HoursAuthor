@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Avtor24 Bot — Вход</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        accent: { 400: '#a78bfa', 500: '#8b5cf6', 600: '#7c3aed', 700: '#6d28d9' },
+                        surface: { 800: '#1e1e2e', 900: '#11111b', 700: '#2a2a3c' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+        .login-glow { box-shadow: 0 0 60px rgba(124, 58, 237, 0.15); }
+        @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-6px)} 75%{transform:translateX(6px)} }
+        .shake { animation: shake 0.3s ease-in-out; }
+        @keyframes fadeIn { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+        .fade-in { animation: fadeIn 0.5s ease-out; }
+    </style>
+</head>
+<body class="bg-surface-900 min-h-screen flex items-center justify-center p-4">
+    <div id="app" class="w-full max-w-md fade-in">
+        <!-- Logo / Brand -->
+        <div class="text-center mb-8">
+            <div class="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-accent-600/20 mb-4">
+                <svg class="w-8 h-8 text-accent-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                </svg>
+            </div>
+            <h1 class="text-2xl font-bold text-white">Avtor24 Bot</h1>
+            <p class="text-gray-500 text-sm mt-1">Панель управления</p>
+        </div>
+
+        <!-- Login Card -->
+        <div id="loginCard" class="bg-surface-800 rounded-2xl p-8 login-glow border border-gray-800/50">
+            <form id="loginForm" onsubmit="handleLogin(event)">
+                <!-- Username -->
+                <div class="mb-5">
+                    <label class="block text-sm font-medium text-gray-400 mb-2">Логин</label>
+                    <div class="relative">
+                        <span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500">
+                            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0"/>
+                            </svg>
+                        </span>
+                        <input type="text" id="username" name="username" required autocomplete="username"
+                               class="w-full bg-surface-900 border border-gray-700 rounded-xl pl-11 pr-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500/50 transition"
+                               placeholder="admin">
+                    </div>
+                </div>
+
+                <!-- Password -->
+                <div class="mb-5">
+                    <label class="block text-sm font-medium text-gray-400 mb-2">Пароль</label>
+                    <div class="relative">
+                        <span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500">
+                            <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z"/>
+                            </svg>
+                        </span>
+                        <input type="password" id="password" name="password" required autocomplete="current-password"
+                               class="w-full bg-surface-900 border border-gray-700 rounded-xl pl-11 pr-4 py-3 text-white placeholder-gray-600 focus:outline-none focus:border-accent-500 focus:ring-1 focus:ring-accent-500/50 transition"
+                               placeholder="••••••••">
+                    </div>
+                </div>
+
+                <!-- Remember -->
+                <div class="flex items-center justify-between mb-6">
+                    <label class="flex items-center gap-2 cursor-pointer">
+                        <input type="checkbox" id="remember" class="w-4 h-4 rounded bg-surface-900 border-gray-600 text-accent-600 focus:ring-accent-500/50">
+                        <span class="text-sm text-gray-400">Запомнить меня</span>
+                    </label>
+                </div>
+
+                <!-- Error -->
+                <div id="errorMsg" class="hidden mb-4 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm text-center"></div>
+
+                <!-- Submit -->
+                <button type="submit" id="submitBtn"
+                        class="w-full py-3 px-4 rounded-xl bg-accent-600 hover:bg-accent-700 text-white font-medium transition-all duration-200 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                    <span id="btnText">Войти</span>
+                    <svg id="btnSpinner" class="hidden w-5 h-5 animate-spin" viewBox="0 0 24 24" fill="none">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
+                    </svg>
+                </button>
+            </form>
+        </div>
+
+        <p class="text-center text-gray-600 text-xs mt-6">Avtor24 Bot v1.0</p>
+    </div>
+
+    <script>
+        async function handleLogin(e) {
+            e.preventDefault();
+            const btn = document.getElementById('submitBtn');
+            const btnText = document.getElementById('btnText');
+            const spinner = document.getElementById('btnSpinner');
+            const errorEl = document.getElementById('errorMsg');
+            const card = document.getElementById('loginCard');
+
+            btn.disabled = true;
+            btnText.textContent = 'Вход...';
+            spinner.classList.remove('hidden');
+            errorEl.classList.add('hidden');
+
+            try {
+                const res = await fetch('/api/dashboard/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: document.getElementById('username').value,
+                        password: document.getElementById('password').value,
+                    }),
+                });
+
+                if (res.ok) {
+                    window.location.href = '/dashboard/';
+                } else {
+                    const data = await res.json().catch(() => ({}));
+                    errorEl.textContent = data.detail || 'Неверный логин или пароль';
+                    errorEl.classList.remove('hidden');
+                    card.classList.add('shake');
+                    setTimeout(() => card.classList.remove('shake'), 400);
+                }
+            } catch (err) {
+                errorEl.textContent = 'Ошибка подключения к серверу';
+                errorEl.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                btnText.textContent = 'Войти';
+                spinner.classList.add('hidden');
+            }
+        }
+    </script>
+</body>
+</html>

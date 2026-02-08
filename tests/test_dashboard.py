@@ -502,3 +502,78 @@ async def test_chat_send_empty(seeded_session, patch_db, patch_auth):
         )
 
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Frontend — HTML pages & static files
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_dashboard_login_page():
+    """GET /dashboard/login → HTML страница логина."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/dashboard/login")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+    assert "Avtor24" in response.text
+    assert "login" in response.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_index_redirect_without_auth():
+    """GET /dashboard/ без токена → редирект на логин."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test", follow_redirects=False) as client:
+        response = await client.get("/dashboard/")
+
+    assert response.status_code == 307
+    assert "/dashboard/login" in response.headers.get("location", "")
+
+
+@pytest.mark.asyncio
+async def test_dashboard_index_with_auth(seeded_session, patch_db, patch_auth):
+    """GET /dashboard/ с валидным токеном → HTML SPA."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        cookies = await _get_auth_cookie(client, patch_auth)
+        client.cookies.update(cookies)
+        response = await client.get("/dashboard/")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers.get("content-type", "")
+    assert "Avtor24" in response.text
+    assert "app.js" in response.text
+
+
+@pytest.mark.asyncio
+async def test_static_css():
+    """GET /dashboard/static/styles.css → CSS файл."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/dashboard/static/styles.css")
+
+    assert response.status_code == 200
+    assert ".card" in response.text
+
+
+@pytest.mark.asyncio
+async def test_static_js():
+    """GET /dashboard/static/app.js → JS файл."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/dashboard/static/app.js")
+
+    assert response.status_code == 200
+    assert "dashboard" in response.text
+
+
+@pytest.mark.asyncio
+async def test_static_not_found():
+    """GET /dashboard/static/nonexistent.txt → 404."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/dashboard/static/nonexistent.txt")
+
+    assert response.status_code == 404

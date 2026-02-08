@@ -2,14 +2,19 @@
 
 import csv
 import io
+import os
 import time
 from datetime import date, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.config import settings
+
+# Путь к папке static
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 from src.database.connection import async_session
 from src.database.crud import (
     get_order,
@@ -422,6 +427,41 @@ async def export_csv(
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=orders.csv"},
     )
+
+
+# ---------------------------------------------------------------------------
+# HTML страницы дашборда + статические файлы
+# ---------------------------------------------------------------------------
+
+@router.get("/dashboard/static/{filepath:path}")
+async def serve_static(filepath: str):
+    """Отдача статических файлов (CSS, JS)."""
+    file_path = os.path.join(STATIC_DIR, filepath)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден")
+    return FileResponse(file_path)
+
+
+@router.get("/dashboard/login")
+async def dashboard_login_page():
+    """Страница логина."""
+    file_path = os.path.join(STATIC_DIR, "login.html")
+    return FileResponse(file_path, media_type="text/html")
+
+
+@router.get("/dashboard/")
+async def dashboard_index(request: Request):
+    """Главная страница дашборда (SPA). Редирект на логин если нет токена."""
+    token = request.cookies.get("dashboard_token")
+    if not token:
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/dashboard/login")
+    from src.dashboard.auth import verify_token
+    if not verify_token(token):
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url="/dashboard/login")
+    file_path = os.path.join(STATIC_DIR, "index.html")
+    return FileResponse(file_path, media_type="text/html")
 
 
 # ---------------------------------------------------------------------------
