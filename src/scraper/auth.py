@@ -39,7 +39,7 @@ async def login() -> Page:
     logger.info("Сессия невалидна, выполняем логин...")
 
     # Переходим на страницу логина
-    login_url = f"{settings.avtor24_base_url}/user/login"
+    login_url = f"{settings.avtor24_base_url}/login"
     await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
     await browser_manager.short_delay()
 
