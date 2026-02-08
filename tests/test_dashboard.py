@@ -16,3 +16,5 @@ async def test_health_endpoint():
     data = response.json()
     assert data["status"] == "ok"
     assert "uptime" in data
+    assert "bot_running" in data
+    assert "scheduler_jobs" in data
