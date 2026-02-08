@@ -1,9 +1,8 @@
-"""Парсинг ленты заказов с Автор24."""
+"""Парсинг ленты заказов с Автор24 (React SPA)."""
 
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional
 
 from playwright.async_api import Page
@@ -25,128 +24,119 @@ class OrderSummary:
     work_type: str = ""
     subject: str = ""
     deadline: Optional[str] = None
-    time_left: Optional[str] = None
-    budget: Optional[int] = None
+    budget: Optional[str] = None
+    budget_rub: Optional[int] = None
     bid_count: int = 0
-    files_count: int = 0
-    customer_online: bool = False
-    customer_badge: str = ""
+    files_info: str = ""
+    customer_online: str = ""
+    customer_badges: list[str] = field(default_factory=list)
     description_preview: str = ""
+    creation_time: str = ""
 
 
 def _extract_number(text: str) -> Optional[int]:
-    """Извлечь число из строки."""
-    match = re.search(r"(\d[\d\s]*)", text.replace(" ", ""))
-    if match:
-        return int(match.group(1))
-    return None
+    """Извлечь число из строки вида '6 000₽' или '4 ставки'."""
+    cleaned = re.sub(r"[^\d]", "", text)
+    return int(cleaned) if cleaned else None
 
 
 async def parse_order_cards(page: Page) -> list[OrderSummary]:
-    """Парсить карточки заказов с текущей страницы."""
+    """Парсить карточки заказов с текущей страницы (React SPA).
+
+    Сайт рендерит карточки через React в div#root.
+    Каждая карточка: .auctionOrder с data-id.
+    """
     orders = []
 
-    # Ожидаем загрузку карточек
-    await page.wait_for_selector(
-        ".order-card, .search-result-item, .order-item, [data-order-id]",
-        timeout=10000,
-    )
+    # Ожидаем загрузку React-компонентов
+    try:
+        await page.wait_for_selector(".auctionOrder", timeout=15000)
+    except Exception:
+        logger.warning("Карточки .auctionOrder не появились за 15 сек")
+        return orders
 
-    cards = await page.locator(
-        ".order-card, .search-result-item, .order-item, [data-order-id]"
-    ).all()
+    # Извлекаем данные через JS (быстрее, чем множественные Playwright-запросы)
+    raw_orders = await page.evaluate("""
+        () => {
+            let cards = document.querySelectorAll('.auctionOrder');
+            return Array.from(cards).map(card => {
+                let orderId = card.getAttribute('data-id') || '';
 
-    for card in cards:
-        try:
-            # ID заказа
-            order_id = await card.get_attribute("data-order-id") or ""
-            if not order_id:
-                link = card.locator("a[href*='/order/']")
-                href = await link.first.get_attribute("href") if await link.count() > 0 else ""
-                if href:
-                    match = re.search(r"/order/(\d+)", href)
-                    order_id = match.group(1) if match else ""
+                // Заголовок
+                let titleEl = card.querySelector('[class*="TitleLinkStyled"] span');
+                let title = titleEl ? titleEl.textContent.trim() : '';
 
-            if not order_id:
-                continue
+                // URL
+                let linkEl = card.querySelector('a[href*="/order/getoneorder/"]');
+                let url = linkEl ? linkEl.getAttribute('href') : '';
 
-            # Заголовок
-            title_el = card.locator(".order-title, .order-card__title, h3, h2").first
-            title = (await title_el.inner_text()).strip() if await card.locator(".order-title, .order-card__title, h3, h2").count() > 0 else ""
+                // Информационные поля (.order-info-text)
+                let infoTexts = Array.from(card.querySelectorAll('.order-info-text')).map(
+                    el => el.textContent.trim()
+                );
+                // Порядок: [тип работы, дедлайн, предмет, файлы]
+                let workType = infoTexts[0] || '';
+                let deadline = infoTexts[1] || '';
+                let subject = infoTexts[2] || '';
+                let filesInfo = infoTexts[3] || '';
 
-            # URL
-            link_el = card.locator("a[href*='/order/']").first
-            url = await link_el.get_attribute("href") if await card.locator("a[href*='/order/']").count() > 0 else ""
-            if url and not url.startswith("http"):
-                url = settings.avtor24_base_url + url
+                // Описание
+                let descEl = card.querySelector('[class*="DescriptionStyled"]');
+                let description = descEl ? descEl.textContent.trim() : '';
 
-            # Тип работы
-            work_type_el = card.locator(".order-type, .work-type, .order-card__type")
-            work_type = (await work_type_el.first.inner_text()).strip() if await work_type_el.count() > 0 else ""
+                // Бюджет
+                let budgetEl = card.querySelector('[class*="OrderBudgetStyled"]');
+                let budget = budgetEl ? budgetEl.textContent.trim() : '';
 
-            # Предмет
-            subject_el = card.locator(".order-subject, .subject, .order-card__subject")
-            subject = (await subject_el.first.inner_text()).strip() if await subject_el.count() > 0 else ""
+                // Ставки
+                let offersEl = card.querySelector('[class*="OffersStyled"]');
+                let offersText = offersEl ? offersEl.textContent.trim() : '';
+                let bidsMatch = offersText.match(/(\\d+)\\s*став/);
+                let bidCount = bidsMatch ? parseInt(bidsMatch[1]) : 0;
 
-            # Дедлайн
-            deadline_el = card.locator(".order-deadline, .deadline, .order-card__deadline")
-            deadline = (await deadline_el.first.inner_text()).strip() if await deadline_el.count() > 0 else None
+                // Время создания
+                let timeEl = card.querySelector('.orderCreation');
+                let creationTime = timeEl ? timeEl.textContent.trim() : '';
 
-            # Осталось времени
-            time_left_el = card.locator(".time-left, .order-card__time-left")
-            time_left = (await time_left_el.first.inner_text()).strip() if await time_left_el.count() > 0 else None
+                // Онлайн-статус заказчика
+                let onlineEl = card.querySelector('[class*="CustomerOnlineStyled"]');
+                let customerOnline = onlineEl ? onlineEl.textContent.trim() : '';
 
-            # Бюджет
-            budget = None
-            budget_el = card.locator(".order-price, .price, .order-card__price, .budget")
-            if await budget_el.count() > 0:
-                budget_text = await budget_el.first.inner_text()
-                budget = _extract_number(budget_text)
+                // Бейджи (Постоянный клиент, и т.д.)
+                let badgeEls = card.querySelectorAll('[class*="customer_label"], [class*="Badges"] b');
+                let badges = Array.from(badgeEls).map(el => el.textContent.trim()).filter(Boolean);
 
-            # Количество ставок
-            bid_count = 0
-            bid_el = card.locator(".bid-count, .bids, .order-card__bids")
-            if await bid_el.count() > 0:
-                bid_text = await bid_el.first.inner_text()
-                bid_count = _extract_number(bid_text) or 0
+                return {
+                    orderId, title, url, workType, deadline, subject,
+                    filesInfo, description, budget, bidCount,
+                    creationTime, customerOnline, badges,
+                };
+            });
+        }
+    """)
 
-            # Файлы
-            files_count = 0
-            files_el = card.locator(".files-count, .attachments, .order-card__files")
-            if await files_el.count() > 0:
-                files_text = await files_el.first.inner_text()
-                files_count = _extract_number(files_text) or 0
-
-            # Онлайн ли заказчик
-            customer_online = await card.locator(".online, .is-online, .user-online").count() > 0
-
-            # Бейдж заказчика
-            badge_el = card.locator(".customer-badge, .badge, .user-badge")
-            customer_badge = (await badge_el.first.inner_text()).strip() if await badge_el.count() > 0 else ""
-
-            # Превью описания
-            desc_el = card.locator(".order-description, .description, .order-card__desc")
-            description_preview = (await desc_el.first.inner_text()).strip() if await desc_el.count() > 0 else ""
-
-            orders.append(OrderSummary(
-                order_id=order_id,
-                title=title,
-                url=url,
-                work_type=work_type,
-                subject=subject,
-                deadline=deadline,
-                time_left=time_left,
-                budget=budget,
-                bid_count=bid_count,
-                files_count=files_count,
-                customer_online=customer_online,
-                customer_badge=customer_badge,
-                description_preview=description_preview,
-            ))
-
-        except Exception as e:
-            logger.warning("Ошибка парсинга карточки заказа: %s", e)
+    for raw in raw_orders:
+        if not raw["orderId"]:
             continue
+
+        budget_rub = _extract_number(raw["budget"]) if raw["budget"] else None
+
+        orders.append(OrderSummary(
+            order_id=raw["orderId"],
+            title=raw["title"],
+            url=raw["url"],
+            work_type=raw["workType"],
+            subject=raw["subject"],
+            deadline=raw["deadline"] or None,
+            budget=raw["budget"],
+            budget_rub=budget_rub,
+            bid_count=raw["bidCount"],
+            files_info=raw["filesInfo"],
+            customer_online=raw["customerOnline"],
+            customer_badges=raw["badges"],
+            description_preview=raw["description"],
+            creation_time=raw["creationTime"],
+        ))
 
     return orders
 
@@ -160,7 +150,11 @@ async def fetch_order_list(page: Page, max_pages: int = 3) -> list[OrderSummary]
         logger.info("Парсинг страницы %d: %s", page_num, url)
 
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # React SPA — ждём рендеринга
+            await browser_manager.short_delay()
+            await page.wait_for_selector(".auctionOrder", timeout=15000)
+            # Дополнительная задержка для полного рендера
             await browser_manager.short_delay()
 
             orders = await parse_order_cards(page)

@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # База данных
     database_url: str = "sqlite+aiosqlite:///./avtor24.db"
 
+    # Верификация по телефону (countrylock)
+    avtor24_phone_last4: str = ""
+
     # Прокси
     proxy_ru: str = ""
 

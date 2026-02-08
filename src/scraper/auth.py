@@ -1,6 +1,7 @@
-"""Авторизация на Автор24 — логин, cookies, проверка сессии."""
+"""Авторизация на Автор24 — логин, cookies, countrylock, проверка сессии."""
 
 import logging
+import re
 from typing import Optional
 
 from playwright.async_api import Page
@@ -12,16 +13,12 @@ logger = logging.getLogger(__name__)
 
 
 async def is_logged_in(page: Page) -> bool:
-    """Проверить, залогинен ли пользователь (наличие ссылки на профиль/кабинет)."""
+    """Проверить, залогинен ли пользователь (попробовать открыть /order/search)."""
     try:
-        await page.goto(settings.avtor24_base_url, wait_until="domcontentloaded", timeout=30000)
-        await browser_manager.short_delay()
-
-        # Ищем признаки авторизации: ссылка на кабинет, аватар, кнопка "Выход"
-        logged = await page.locator(
-            'a[href*="/cabinet"], a[href*="/user/profile"], .user-menu, .header-user'
-        ).count()
-        return logged > 0
+        api = browser_manager.context.request
+        resp = await api.get(f"{settings.avtor24_base_url}/order/search")
+        # Если не редиректит на /login, значит залогинены
+        return "/login" not in resp.url
     except Exception as e:
         logger.warning("Ошибка проверки сессии: %s", e)
         return False
@@ -30,6 +27,7 @@ async def is_logged_in(page: Page) -> bool:
 async def login() -> Page:
     """Авторизоваться на Автор24. Возвращает страницу."""
     page = await browser_manager.start()
+    api = browser_manager.context.request
 
     # Сначала проверяем сохранённую сессию
     if await is_logged_in(page):
@@ -38,38 +36,66 @@ async def login() -> Page:
 
     logger.info("Сессия невалидна, выполняем логин...")
 
-    # Переходим на страницу логина
+    # Шаг 1: GET /login для CSRF-токена
     login_url = f"{settings.avtor24_base_url}/login"
-    await page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
-    await browser_manager.short_delay()
+    resp1 = await api.get(login_url)
+    body1 = await resp1.text()
 
-    # Заполняем форму
-    email_input = page.locator('input[name="email"], input[type="email"], #email')
-    password_input = page.locator('input[name="password"], input[type="password"], #password')
+    csrf_match = re.search(r'name="ci_csrf_token"\s+value="([^"]+)"', body1)
+    if not csrf_match:
+        raise RuntimeError("Не найден CSRF-токен на странице логина")
+    csrf_token = csrf_match.group(1)
+    logger.debug("CSRF-токен получен: %s...", csrf_token[:10])
 
-    await email_input.fill(settings.avtor24_email)
-    await browser_manager.short_delay()
-    await password_input.fill(settings.avtor24_password)
-    await browser_manager.short_delay()
-
-    # Нажимаем кнопку "Войти"
-    submit_btn = page.locator(
-        'button[type="submit"], input[type="submit"], .login-btn, button:has-text("Войти")'
+    # Шаг 2: POST /login через API (cookies shared с браузером)
+    resp2 = await api.post(
+        login_url,
+        form={
+            "ci_csrf_token": csrf_token,
+            "email": settings.avtor24_email,
+            "password": settings.avtor24_password,
+        },
     )
-    await submit_btn.click()
+    logger.info("POST /login: status=%d, url=%s", resp2.status, resp2.url)
 
-    # Ждём навигацию (редирект после логина)
-    await page.wait_for_load_state("domcontentloaded", timeout=15000)
-    await browser_manager.short_delay()
+    # Шаг 3: Обработка countrylock (верификация по телефону)
+    if "countrylock" in resp2.url:
+        logger.info("Требуется верификация по телефону (countrylock)")
+        body2 = await resp2.text()
 
-    # Проверяем успешность
-    if await is_logged_in(page):
-        logger.info("Логин успешен")
-        await browser_manager.save_cookies()
-    else:
-        logger.error("Логин не удался — проверьте учётные данные")
-        raise RuntimeError("Не удалось авторизоваться на Автор24")
+        if not settings.avtor24_phone_last4:
+            raise RuntimeError(
+                "Сайт требует верификацию по телефону, но AVTOR24_PHONE_LAST4 не задан в .env"
+            )
 
+        # Извлечь CSRF с countrylock-страницы (если есть)
+        csrf2_match = re.search(r'name="ci_csrf_token"\s+value="([^"]+)"', body2)
+        form_data = {"num": settings.avtor24_phone_last4}
+        if csrf2_match:
+            form_data["ci_csrf_token"] = csrf2_match.group(1)
+
+        resp3 = await api.post(
+            f"{settings.avtor24_base_url}/auth/countrylock/",
+            form=form_data,
+        )
+        logger.info("POST /auth/countrylock/: status=%d, url=%s", resp3.status, resp3.url)
+
+        if "countrylock" in resp3.url:
+            body3 = await resp3.text()
+            attempts_match = re.search(r"Осталось\s+(\d+)\s+попыт", body3)
+            remaining = attempts_match.group(1) if attempts_match else "?"
+            raise RuntimeError(
+                f"Верификация по телефону не прошла (осталось {remaining} попыток). "
+                "Проверьте AVTOR24_PHONE_LAST4 в .env"
+            )
+
+    # Шаг 4: Проверяем успешность логина
+    resp_check = await api.get(f"{settings.avtor24_base_url}/order/search")
+    if "/login" in resp_check.url:
+        raise RuntimeError("Не удалось авторизоваться на Автор24 — проверьте учётные данные")
+
+    logger.info("Логин успешен")
+    await browser_manager.save_cookies()
     return page
 
 
@@ -81,7 +107,8 @@ async def refresh_session() -> None:
         return
 
     try:
-        await page.goto(settings.avtor24_base_url, wait_until="domcontentloaded", timeout=30000)
+        api = browser_manager.context.request
+        await api.get(settings.avtor24_base_url)
         await browser_manager.save_cookies()
         logger.info("Сессия обновлена")
     except Exception as e:

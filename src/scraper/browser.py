@@ -4,8 +4,10 @@ import asyncio
 import random
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Locator
 
@@ -62,9 +64,17 @@ class BrowserManager:
             ],
         }
 
-        # Прокси
+        # Прокси — разбиваем URL на server/username/password
         if settings.proxy_ru:
-            launch_args["proxy"] = {"server": settings.proxy_ru}
+            parsed = urlparse(settings.proxy_ru)
+            proxy_cfg = {
+                "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+            }
+            if parsed.username:
+                proxy_cfg["username"] = parsed.username
+            if parsed.password:
+                proxy_cfg["password"] = parsed.password
+            launch_args["proxy"] = proxy_cfg
 
         self._browser = await self._playwright.chromium.launch(**launch_args)
 
