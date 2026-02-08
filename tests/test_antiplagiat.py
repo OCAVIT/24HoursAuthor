@@ -385,7 +385,7 @@ class TestRewriteLoop:
         """Неподдерживаемый тип → (None, None)."""
         from src.generator.router import generate_and_check
         result, check = await generate_and_check(
-            work_type="Курсовая работа",
+            work_type="Онлайн-консультация",
             title="Тест",
         )
         assert result is None

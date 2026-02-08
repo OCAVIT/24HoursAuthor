@@ -205,7 +205,39 @@ async function generateDocx(data) {
 }
 
 function buildTitlePage(title, workType, subject, author, university, fontSize) {
+  // Типы без титульного листа
+  const noTitleTypes = [
+    "Копирайтинг", "Набор текста", "Перевод",
+    "Повышение уникальности текста", "Гуманизация работы",
+  ];
+  if (noTitleTypes.includes(workType)) {
+    return [];
+  }
+
   const paragraphs = [];
+
+  // Министерство (для ВКР/дипломных/курсовых)
+  const academicTypes = [
+    "Курсовая работа", "Дипломная работа",
+    "Выпускная квалификационная работа (ВКР)",
+    "Монография", "Научно-исследовательская работа (НИР)",
+    "Индивидуальный проект",
+  ];
+  if (academicTypes.includes(workType)) {
+    paragraphs.push(
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: "МИНИСТЕРСТВО НАУКИ И ВЫСШЕГО ОБРАЗОВАНИЯ РОССИЙСКОЙ ФЕДЕРАЦИИ",
+            font: "Times New Roman",
+            size: fontSize - 2,
+          }),
+        ],
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 100 },
+      })
+    );
+  }
 
   // Университет
   if (university) {
@@ -221,7 +253,8 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
   }
 
   // Пустое пространство
-  for (let i = 0; i < 6; i++) {
+  const spaceBefore = academicTypes.includes(workType) ? 4 : 6;
+  for (let i = 0; i < spaceBefore; i++) {
     paragraphs.push(new Paragraph({ children: [] }));
   }
 
@@ -270,7 +303,7 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
     paragraphs.push(new Paragraph({ children: [] }));
   }
 
-  // Автор (справа)
+  // Автор (справа) — для академических работ добавляем научного руководителя
   if (author) {
     paragraphs.push(
       new Paragraph({
@@ -282,12 +315,24 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
     );
   }
 
+  if (academicTypes.includes(workType)) {
+    paragraphs.push(
+      new Paragraph({
+        children: [
+          new TextRun({ text: "Научный руководитель: _________________", font: "Times New Roman", size: fontSize }),
+        ],
+        alignment: AlignmentType.RIGHT,
+        spacing: { before: 100 },
+      })
+    );
+  }
+
   // Пустое пространство до конца страницы
   for (let i = 0; i < 4; i++) {
     paragraphs.push(new Paragraph({ children: [] }));
   }
 
-  // Год
+  // Город и год
   const year = new Date().getFullYear();
   paragraphs.push(
     new Paragraph({

@@ -3,7 +3,11 @@
 import logging
 from typing import Optional, Callable, Awaitable
 
-from src.generator import essay, referat
+from src.generator import (
+    essay, referat, coursework, diploma, homework,
+    presentation, translation, copywriting, business_plan,
+    practice_report, review, uniqueness,
+)
 from src.generator.essay import GenerationResult
 from src.antiplagiat.checker import check_uniqueness, CheckResult
 from src.antiplagiat.rewriter import rewrite_for_uniqueness
@@ -31,37 +35,51 @@ GENERATORS: dict[str, Optional[GeneratorFunc]] = {
     "Автореферат": referat.generate,
     "Статья ВАК/Scopus": referat.generate,
 
-    # Курсовые (TODO: Этап 5)
-    "Курсовая работа": None,
-    "Научно-исследовательская работа (НИР)": None,
-    "Индивидуальный проект": None,
-    "Маркетинговое исследование": None,
+    # Курсовые
+    "Курсовая работа": coursework.generate,
+    "Научно-исследовательская работа (НИР)": coursework.generate,
+    "Индивидуальный проект": coursework.generate,
+    "Маркетинговое исследование": coursework.generate,
 
-    # Дипломные (TODO: Этап 5)
-    "Выпускная квалификационная работа (ВКР)": None,
-    "Дипломная работа": None,
-    "Монография": None,
+    # Дипломные / ВКР
+    "Выпускная квалификационная работа (ВКР)": diploma.generate,
+    "Дипломная работа": diploma.generate,
+    "Монография": diploma.generate,
 
-    # Контрольные и задачи (TODO: Этап 5)
-    "Контрольная работа": None,
-    "Решение задач": None,
-    "Ответы на вопросы": None,
-    "Лабораторная работа": None,
+    # Контрольные и задачи
+    "Контрольная работа": homework.generate,
+    "Решение задач": homework.generate,
+    "Ответы на вопросы": homework.generate,
+    "Лабораторная работа": homework.generate,
+    "Другое": homework.generate,
 
-    # Другие типы (TODO: Этап 5)
-    "Презентации": None,
-    "Перевод": None,
+    # Презентации
+    "Презентации": presentation.generate,
+
+    # Переводы
+    "Перевод": translation.generate,
+
+    # Копирайтинг
+    "Копирайтинг": copywriting.generate,
+    "Набор текста": copywriting.generate,
+
+    # Повышение уникальности
+    "Повышение уникальности текста": uniqueness.generate,
+    "Гуманизация работы": uniqueness.generate,
+
+    # Бизнес-план
+    "Бизнес-план": business_plan.generate,
+
+    # Отчёт по практике
+    "Отчёт по практике": practice_report.generate,
+
+    # Рецензии и вычитка
+    "Рецензия": review.generate,
+    "Вычитка и рецензирование работ": review.generate,
+    "Проверка работы": review.generate,
+
+    # Задачи по программированию (Этап 6 — sandbox)
     "Задача по программированию": None,
-    "Копирайтинг": None,
-    "Набор текста": None,
-    "Повышение уникальности текста": None,
-    "Гуманизация работы": None,
-    "Бизнес-план": None,
-    "Отчёт по практике": None,
-    "Рецензия": None,
-    "Вычитка и рецензирование работ": None,
-    "Проверка работы": None,
-    "Другое": None,
 
     # Не поддерживаемые (реалтайм)
     "Онлайн-консультация": None,
@@ -244,5 +262,28 @@ def _default_pages(work_type: str) -> int:
         "Статья": 10,
         "Автореферат": 10,
         "Статья ВАК/Scopus": 10,
+        "Курсовая работа": 30,
+        "Научно-исследовательская работа (НИР)": 30,
+        "Индивидуальный проект": 25,
+        "Маркетинговое исследование": 30,
+        "Выпускная квалификационная работа (ВКР)": 80,
+        "Дипломная работа": 80,
+        "Монография": 100,
+        "Контрольная работа": 10,
+        "Решение задач": 5,
+        "Ответы на вопросы": 10,
+        "Лабораторная работа": 10,
+        "Презентации": 15,
+        "Перевод": 10,
+        "Копирайтинг": 5,
+        "Набор текста": 10,
+        "Повышение уникальности текста": 10,
+        "Гуманизация работы": 10,
+        "Бизнес-план": 25,
+        "Отчёт по практике": 20,
+        "Рецензия": 3,
+        "Вычитка и рецензирование работ": 3,
+        "Проверка работы": 3,
+        "Другое": 10,
     }
     return defaults.get(work_type, 15)
