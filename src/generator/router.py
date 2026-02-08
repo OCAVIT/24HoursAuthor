@@ -5,8 +5,12 @@ from typing import Optional, Callable, Awaitable
 
 from src.generator import essay, referat
 from src.generator.essay import GenerationResult
+from src.antiplagiat.checker import check_uniqueness, CheckResult
+from src.antiplagiat.rewriter import rewrite_for_uniqueness
 
 logger = logging.getLogger(__name__)
+
+MAX_REWRITE_ATTEMPTS = 3
 
 # Тип: async function(title, description, subject, pages, ...) -> GenerationResult
 GeneratorFunc = Callable[..., Awaitable[GenerationResult]]
@@ -123,6 +127,109 @@ async def generate_work(
 
     result.work_type = work_type
     return result
+
+
+async def generate_and_check(
+    work_type: str,
+    title: str,
+    description: str = "",
+    subject: str = "",
+    pages: Optional[int] = None,
+    methodology_summary: Optional[str] = None,
+    required_uniqueness: Optional[int] = None,
+    font_size: int = 14,
+    line_spacing: float = 1.5,
+    antiplagiat_system: str = "textru",
+) -> tuple[Optional[GenerationResult], Optional[CheckResult]]:
+    """Сгенерировать работу и проверить уникальность.
+
+    Если уникальность ниже порога — перефразирует текст (до 3 раз).
+
+    Returns:
+        (GenerationResult, CheckResult) или (None, None) если тип не поддерживается.
+    """
+    result = await generate_work(
+        work_type=work_type,
+        title=title,
+        description=description,
+        subject=subject,
+        pages=pages,
+        methodology_summary=methodology_summary,
+        required_uniqueness=required_uniqueness,
+        font_size=font_size,
+        line_spacing=line_spacing,
+    )
+
+    if result is None:
+        return None, None
+
+    target = float(required_uniqueness) if required_uniqueness else 50.0
+
+    # Проверяем уникальность
+    try:
+        check_result = await check_uniqueness(
+            text=result.text,
+            system=antiplagiat_system,
+            required_uniqueness=target,
+        )
+    except Exception as e:
+        logger.error("Ошибка проверки уникальности: %s", e)
+        return result, None
+
+    # Если уникальность достаточна — возвращаем
+    if check_result.is_sufficient:
+        logger.info("Уникальность %.1f%% >= %.1f%% — OK", check_result.uniqueness, target)
+        return result, check_result
+
+    # Рерайт-цикл: до MAX_REWRITE_ATTEMPTS попыток
+    current_text = result.text
+    current_uniqueness = check_result.uniqueness
+
+    for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
+        logger.info(
+            "Рерайт попытка %d/%d: текущая уникальность %.1f%%, цель %.1f%%",
+            attempt, MAX_REWRITE_ATTEMPTS, current_uniqueness, target,
+        )
+
+        try:
+            rewrite_result = await rewrite_for_uniqueness(
+                text=current_text,
+                target_percent=target,
+                current_percent=current_uniqueness,
+            )
+            current_text = rewrite_result.text
+
+            # Обновляем токены в результате
+            result.text = current_text
+            result.input_tokens += rewrite_result.input_tokens
+            result.output_tokens += rewrite_result.output_tokens
+            result.total_tokens += rewrite_result.total_tokens
+            result.cost_usd += rewrite_result.cost_usd
+
+            # Повторная проверка
+            check_result = await check_uniqueness(
+                text=current_text,
+                system=antiplagiat_system,
+                required_uniqueness=target,
+            )
+            current_uniqueness = check_result.uniqueness
+
+            if check_result.is_sufficient:
+                logger.info(
+                    "Уникальность достигнута после %d рерайтов: %.1f%%",
+                    attempt, current_uniqueness,
+                )
+                return result, check_result
+
+        except Exception as e:
+            logger.error("Ошибка при рерайте (попытка %d): %s", attempt, e)
+            break
+
+    logger.warning(
+        "Уникальность %.1f%% после %d попыток рерайта (цель %.1f%%)",
+        current_uniqueness, MAX_REWRITE_ATTEMPTS, target,
+    )
+    return result, check_result
 
 
 def _default_pages(work_type: str) -> int:
