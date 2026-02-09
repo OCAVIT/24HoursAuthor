@@ -3,6 +3,25 @@
 import re
 
 
+def strip_markdown(text: str) -> str:
+    """Убрать markdown-разметку из текста."""
+    # Заголовки: # Текст, ## Текст, ### Текст
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Bold: **текст** → текст
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    # Italic: *текст* → текст (но не **, уже убрали)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
+    # Маркированные списки: - текст или * текст в начале строки
+    text = re.sub(r"^[-*]\s+", "", text, flags=re.MULTILINE)
+    # Цитаты: > текст
+    text = re.sub(r"^>\s+", "", text, flags=re.MULTILINE)
+    # Inline code: `текст`
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # Code blocks: ```...```
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    return text
+
+
 def normalize_text(text: str) -> str:
     """Нормализовать текст: лишние пробелы, переносы строк."""
     # Убираем множественные пробелы

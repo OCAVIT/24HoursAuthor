@@ -8,11 +8,13 @@
 """
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 from src.ai_client import chat_completion, chat_completion_json
 from src.config import settings
+from src.docgen.formatter import strip_markdown, normalize_text
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,33 @@ def _accumulate(result: StepwiseResult, tokens_info: dict):
     result.output_tokens += tokens_info.get("output_tokens", 0)
     result.cost_usd += tokens_info.get("cost_usd", 0.0)
     result.total_tokens = result.input_tokens + result.output_tokens
+
+
+def clean_section_text(name: str, text: str) -> str:
+    """Постобработка текста раздела: убрать markdown и дублирующийся заголовок."""
+    # Убрать markdown-разметку
+    text = strip_markdown(text)
+
+    # Убрать дублирование заголовка раздела в начале текста.
+    # GPT часто начинает с заголовка вроде "Введение" или "1.1 Подраздел",
+    # а assemble_text() добавляет заголовок автоматически.
+    lines = text.split("\n", 1)
+    if lines:
+        first_line = lines[0].strip()
+        # Нормализуем для сравнения: убираем нумерацию, точки, пробелы
+        name_clean = re.sub(r"^[\d.\s]+", "", name).strip().lower()
+        first_clean = re.sub(r"^[\d.\s]+", "", first_line).strip().lower()
+        # Убираем первую строку если она совпадает с заголовком раздела
+        if name_clean and first_clean and (
+            name_clean == first_clean
+            or first_clean.startswith(name_clean)
+            or name_clean.startswith(first_clean)
+        ):
+            text = lines[1].lstrip("\n") if len(lines) > 1 else ""
+
+    # Нормализация пробелов и переносов
+    text = normalize_text(text)
+    return text
 
 
 async def generate_plan(
@@ -154,7 +183,23 @@ async def generate_section(
         f"\nНапиши раздел: {section.name}",
         f"Целевой объём раздела: {section.target_words} слов (~{target_chars} символов).",
         "Пиши содержательно, с примерами и аргументацией. Выдерживай академический стиль.",
+        "\nВАЖНО:"
+        "\n- НЕ начинай текст с заголовка раздела — заголовок добавляется автоматически."
+        "\n- НЕ используй markdown-разметку (символы #, ##, **, *, >, ```, -)."
+        "\n- Пиши только чистый текст абзацами, без форматирования.",
     ]
+
+    # Специальные инструкции для библиографии
+    name_lower = section.name.lower()
+    if "литератур" in name_lower or "библиограф" in name_lower or "источник" in name_lower:
+        user_parts.append(
+            "\nОСОБЫЕ ТРЕБОВАНИЯ К БИБЛИОГРАФИИ:"
+            "\n- Используй ТОЛЬКО реально существующие и широко известные источники."
+            "\n- Предпочитай учебники известных авторов, которые точно существуют."
+            "\n- Формат оформления: ГОСТ Р 7.0.5-2008."
+            "\n- НЕ придумывай несуществующих книг, авторов или издательств."
+            "\n- Лучше дать меньше источников, но реальных, чем много вымышленных."
+        )
 
     if previous_summaries:
         summaries_text = "\n".join(previous_summaries[-3:])
@@ -179,7 +224,7 @@ async def generate_section(
         max_tokens=max_tokens,
     )
 
-    text = result["content"]
+    text = clean_section_text(section.name, result["content"])
     generated = GeneratedSection(name=section.name, text=text, target_words=section.target_words)
 
     tokens_info = {
@@ -249,6 +294,10 @@ async def expand_to_target(
                     f"Расширь этот раздел, добавь примеры, детали и аргументацию, "
                     f"нужно ещё {needed_words} слов. "
                     f"Верни ПОЛНЫЙ текст раздела (старый + новый контент, без повторов)."
+                    f"\n\nВАЖНО:"
+                    f"\n- НЕ добавляй заголовок раздела — он добавляется автоматически."
+                    f"\n- НЕ используй markdown-разметку (символы #, ##, **, *, >, ```, -)."
+                    f"\n- Пиши только чистый текст абзацами."
                 )},
             ],
             model=settings.openai_model_main,
@@ -258,7 +307,7 @@ async def expand_to_target(
 
         sections[shortest_idx] = GeneratedSection(
             name=shortest.name,
-            text=result["content"],
+            text=clean_section_text(shortest.name, result["content"]),
             target_words=shortest.target_words,
         )
         total_input += result["input_tokens"]
@@ -278,8 +327,9 @@ def assemble_text(sections: list[GeneratedSection], uppercase_names: bool = True
     parts = []
     for s in sections:
         heading = s.name.upper() if uppercase_names else s.name
-        parts.append(f"{heading}\n\n{s.text}")
-    return "\n\n".join(parts)
+        text = clean_section_text(s.name, s.text)
+        parts.append(f"{heading}\n\n{text}")
+    return normalize_text("\n\n".join(parts))
 
 
 async def stepwise_generate(
