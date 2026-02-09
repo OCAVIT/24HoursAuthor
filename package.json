@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "DOCX generation for Avtor24 bot",
   "dependencies": {
+    "avtor24-docx": "file:",
     "docx": "^8.5.0"
   }
 }
