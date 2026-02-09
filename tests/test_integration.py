@@ -226,7 +226,8 @@ class TestOrderScanScoreBidCycle:
             url="https://avtor24.ru/order/20001",
             work_type="Эссе",
             subject="Экономика",
-            budget=2000,
+            budget="2000₽",
+            budget_rub=2000,
             bid_count=1,
         )
 
@@ -240,7 +241,8 @@ class TestOrderScanScoreBidCycle:
             description="Написать эссе 5-7 страниц о рыночных механизмах",
             pages_min=5,
             pages_max=7,
-            budget=2000,
+            budget="2000₽",
+            budget_rub=2000,
             required_uniqueness=60,
         )
 

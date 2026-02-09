@@ -78,10 +78,10 @@ def calculate_price(order: OrderDetail) -> int:
 
 def _try_budget_based(order: OrderDetail) -> Optional[int]:
     """Рассчитать цену на основе бюджета заказчика."""
-    if not order.budget or order.budget <= 0:
+    if not order.budget_rub or order.budget_rub <= 0:
         return None
     factor = random.uniform(0.85, 0.95)
-    return max(MIN_BID, int(order.budget * factor))
+    return max(MIN_BID, int(order.budget_rub * factor))
 
 
 def _try_average_bid_based(order: OrderDetail) -> Optional[int]:

@@ -11,7 +11,7 @@ import pytest_asyncio
 
 from src.scraper.browser import BrowserManager, USER_AGENTS, VIEWPORTS, COOKIES_PATH
 from src.scraper.orders import parse_order_cards, OrderSummary, _extract_number
-from src.scraper.order_detail import fetch_order_detail, OrderDetail, _parse_int, _parse_float
+from src.scraper.order_detail import fetch_order_detail, OrderDetail, _extract_int, _extract_float
 from src.scraper.bidder import place_bid
 from src.scraper.chat import get_messages, send_message, ChatMessage
 
@@ -653,11 +653,11 @@ class TestBidder:
         error_el.count = AsyncMock(return_value=0)
 
         def page_locator(sel):
-            if "price" in sel:
+            if "inputBid" in sel or "MakeOffer" in sel:
                 return price_input
-            elif "comment" in sel:
+            elif "comment" in sel or "makeOffer_comment" in sel:
                 return comment_input
-            elif "ставк" in sel or "Предложить" in sel:
+            elif "Поставить ставку" in sel:
                 return submit_btn
             elif "error" in sel:
                 return error_el
@@ -725,11 +725,11 @@ class TestBidder:
         error_el.first.inner_text = AsyncMock(return_value="Вы уже поставили ставку")
 
         def page_locator(sel):
-            if "price" in sel:
+            if "inputBid" in sel or "MakeOffer" in sel:
                 return price_input
-            elif "comment" in sel:
+            elif "comment" in sel or "makeOffer_comment" in sel:
                 return comment_input
-            elif "ставк" in sel or "Предложить" in sel:
+            elif "Поставить ставку" in sel:
                 return submit_btn
             elif "error" in sel:
                 return error_el
@@ -884,18 +884,18 @@ class TestUtils:
         assert _extract_number("0 файлов") == 0
         assert _extract_number("нет") is None
 
-    def test_parse_int(self):
-        """_parse_int извлекает целые числа."""
-        assert _parse_int("60%") == 60
-        assert _parse_int("20 дней") == 20
-        assert _parse_int("нет") is None
+    def test_extract_int(self):
+        """_extract_int извлекает целые числа."""
+        assert _extract_int("60%") == 60
+        assert _extract_int("20 дней") == 20
+        assert _extract_int("нет") is None
 
-    def test_parse_float(self):
-        """_parse_float извлекает дробные числа."""
-        assert _parse_float("1.5") == 1.5
-        assert _parse_float("1,5") == 1.5
-        assert _parse_float("14") == 14.0
-        assert _parse_float("нет") is None
+    def test_extract_float(self):
+        """_extract_float извлекает дробные числа."""
+        assert _extract_float("1.5") == 1.5
+        assert _extract_float("1,5") == 1.5
+        assert _extract_float("14") == 14.0
+        assert _extract_float("нет") is None
 
 
 # ===== Тест дедупликации через БД =====

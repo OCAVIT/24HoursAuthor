@@ -28,6 +28,7 @@ class OrderSummary:
     budget_rub: Optional[int] = None
     bid_count: int = 0
     files_info: str = ""
+    customer_name: str = ""
     customer_online: str = ""
     customer_badges: list[str] = field(default_factory=list)
     description_preview: str = ""
@@ -102,6 +103,21 @@ async def parse_order_cards(page: Page) -> list[OrderSummary]:
                 let onlineEl = card.querySelector('[class*="CustomerOnlineStyled"]');
                 let customerOnline = onlineEl ? onlineEl.textContent.trim() : '';
 
+                // Имя заказчика
+                let customerNameEl = card.querySelector('[class*="CustomerStyled"] a, [class*="customer"] a[href*="/user/"], a[href*="/user/"]');
+                let customerName = customerNameEl ? customerNameEl.textContent.trim() : '';
+                // Fallback: ищем текст рядом с "Заказчик" или в блоке CustomerStyled
+                if (!customerName) {
+                    let custBlock = card.querySelector('[class*="CustomerStyled"], [class*="customer"]');
+                    if (custBlock) {
+                        let lines = custBlock.innerText.split('\\n').map(s => s.trim()).filter(Boolean);
+                        customerName = lines.find(t =>
+                            t !== 'Заказчик' && !t.includes('онлайн') && !t.includes('назад')
+                            && !t.includes('сейчас') && t.length > 1
+                        ) || '';
+                    }
+                }
+
                 // Бейджи (Постоянный клиент, и т.д.)
                 let badgeEls = card.querySelectorAll('[class*="customer_label"], [class*="Badges"] b');
                 let badges = Array.from(badgeEls).map(el => el.textContent.trim()).filter(Boolean);
@@ -109,7 +125,7 @@ async def parse_order_cards(page: Page) -> list[OrderSummary]:
                 return {
                     orderId, title, url, workType, deadline, subject,
                     filesInfo, description, budget, bidCount,
-                    creationTime, customerOnline, badges,
+                    creationTime, customerOnline, customerName, badges,
                 };
             });
         }
@@ -132,6 +148,7 @@ async def parse_order_cards(page: Page) -> list[OrderSummary]:
             budget_rub=budget_rub,
             bid_count=raw["bidCount"],
             files_info=raw["filesInfo"],
+            customer_name=raw.get("customerName", ""),
             customer_online=raw["customerOnline"],
             customer_badges=raw["badges"],
             description_preview=raw["description"],

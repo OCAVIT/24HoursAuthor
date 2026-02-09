@@ -27,7 +27,8 @@ def _make_order(**kwargs) -> OrderDetail:
         "work_type": "Эссе",
         "subject": "Философия",
         "description": "Напишите эссе на тему свободы",
-        "budget": 1500,
+        "budget": "1500₽",
+        "budget_rub": 1500,
         "pages_min": 5,
         "pages_max": 7,
         "required_uniqueness": 60,
@@ -151,7 +152,7 @@ class TestOrderScorer:
 
     def test_build_order_prompt_with_files(self):
         """Промпт упоминает прикреплённые файлы."""
-        order = _make_order(file_urls=["http://example.com/file1.pdf", "http://example.com/file2.pdf"])
+        order = _make_order(file_names=["http://example.com/file1.pdf", "http://example.com/file2.pdf"])
         prompt = _build_order_prompt(order)
         assert "2" in prompt  # 2 файла
 
@@ -163,14 +164,14 @@ class TestPriceCalculator:
 
     def test_budget_based_pricing(self):
         """Цена на основе бюджета заказчика: 85-95% от бюджета."""
-        order = _make_order(budget=3000)
+        order = _make_order(budget="3000₽", budget_rub=3000)
         for _ in range(20):
             price = calculate_price(order)
             assert 2550 <= price <= 2850  # 85-95% от 3000
 
     def test_average_bid_based_pricing(self):
         """Если нет бюджета — используем среднюю ставку."""
-        order = _make_order(budget=None, average_bid=2000)
+        order = _make_order(budget=None, budget_rub=None, average_bid=2000)
         for _ in range(20):
             price = calculate_price(order)
             assert 1800 <= price <= 2000  # 90-100% от 2000
@@ -178,7 +179,7 @@ class TestPriceCalculator:
     def test_formula_based_pricing(self):
         """Если нет ни бюджета ни ставок — формула."""
         order = _make_order(
-            budget=None, average_bid=None,
+            budget=None, budget_rub=None, average_bid=None,
             work_type="Эссе", pages_max=5,
         )
         price = calculate_price(order)
@@ -188,14 +189,14 @@ class TestPriceCalculator:
 
     def test_minimum_bid(self):
         """Цена не может быть меньше MIN_BID."""
-        order = _make_order(budget=100, average_bid=None)
+        order = _make_order(budget="100₽", budget_rub=100, average_bid=None)
         price = calculate_price(order)
         assert price >= MIN_BID
 
     def test_referat_price(self):
         """Цена реферата по формуле."""
         order = _make_order(
-            budget=None, average_bid=None,
+            budget=None, budget_rub=None, average_bid=None,
             work_type="Реферат", pages_max=15,
         )
         price = calculate_price(order)
@@ -206,7 +207,7 @@ class TestPriceCalculator:
     def test_coursework_price(self):
         """Цена курсовой по формуле."""
         order = _make_order(
-            budget=None, average_bid=None,
+            budget=None, budget_rub=None, average_bid=None,
             work_type="Курсовая работа", pages_max=30,
         )
         price = calculate_price(order)
@@ -222,8 +223,8 @@ class TestPriceCalculator:
 
     def test_complexity_factor_with_files(self):
         """Наличие файлов увеличивает коэффициент."""
-        order_no_files = _make_order(file_urls=[])
-        order_files = _make_order(file_urls=["file1.pdf"])
+        order_no_files = _make_order(file_names=[])
+        order_files = _make_order(file_names=["file1.pdf"])
         assert _complexity_factor(order_files) > _complexity_factor(order_no_files)
 
     def test_default_pages(self):
@@ -235,7 +236,7 @@ class TestPriceCalculator:
 
     def test_try_budget_based_none_budget(self):
         """Без бюджета → None."""
-        order = _make_order(budget=None)
+        order = _make_order(budget=None, budget_rub=None)
         assert _try_budget_based(order) is None
 
     def test_try_average_bid_based_none(self):

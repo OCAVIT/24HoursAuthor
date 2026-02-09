@@ -31,10 +31,9 @@ async def place_bid(page: Page, order_url: str, price: int, comment: str) -> boo
             await page.goto(order_url, wait_until="domcontentloaded", timeout=30000)
             await browser_manager.short_delay()
 
-        # Заполняем цену
+        # Заполняем цену (реальный селектор: #MakeOffer__inputBid)
         price_input = page.locator(
-            'input[name="price"], input[name="bid_price"], '
-            '#bid-price, .bid-price-input, input[placeholder*="ставк"]'
+            '#MakeOffer__inputBid, input[id*="inputBid"]'
         )
         if await price_input.count() == 0:
             logger.error("Не найдено поле для ввода ставки на %s", order_url)
@@ -43,10 +42,10 @@ async def place_bid(page: Page, order_url: str, price: int, comment: str) -> boo
         await price_input.first.fill(str(price))
         await browser_manager.short_delay()
 
-        # Заполняем комментарий
+        # Заполняем комментарий (реальный селектор: #makeOffer_comment)
         comment_input = page.locator(
-            'textarea[name="comment"], textarea[name="bid_comment"], '
-            '#bid-comment, .bid-comment-input, textarea[placeholder*="коммент"]'
+            '#makeOffer_comment, textarea[id*="comment"], '
+            'textarea[placeholder*="приветствен"]'
         )
         if await comment_input.count() > 0:
             await comment_input.first.fill(comment)
@@ -54,8 +53,7 @@ async def place_bid(page: Page, order_url: str, price: int, comment: str) -> boo
 
         # Нажимаем кнопку "Поставить ставку"
         submit_btn = page.locator(
-            'button:has-text("ставк"), button:has-text("Предложить"), '
-            'input[type="submit"][value*="ставк"], .bid-submit, .place-bid-btn'
+            'button:has-text("Поставить ставку")'
         )
         if await submit_btn.count() == 0:
             logger.error("Не найдена кнопка отправки ставки на %s", order_url)
