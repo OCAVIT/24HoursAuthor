@@ -85,8 +85,8 @@ def _build_order_prompt(order: OrderDetail) -> str:
     if order.average_bid:
         parts.append(f"Средняя ставка: {order.average_bid} руб.")
 
-    if order.file_urls:
-        parts.append(f"Прикреплённых файлов: {len(order.file_urls)}")
+    if order.file_names:
+        parts.append(f"Прикреплённых файлов: {len(order.file_names)}")
 
     return "\n".join(parts)
 

@@ -141,7 +141,7 @@ def _complexity_factor(order: OrderDetail) -> float:
         factor += 0.05
 
     # Наличие методички — точнее ТЗ, но и требования строже
-    if order.file_urls:
+    if order.file_names:
         factor += 0.05
 
     return factor
