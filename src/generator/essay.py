@@ -1,20 +1,24 @@
-"""Генератор эссе и сочинений."""
+"""Генератор эссе и сочинений (пошаговая генерация: план → разделы → расширение)."""
 
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from src.ai_client import chat_completion
-from src.config import settings
+from src.generator.stepwise import stepwise_generate, CHARS_PER_PAGE
 
 logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 SYSTEM_PROMPT = (PROMPTS_DIR / "essay_system.txt").read_text(encoding="utf-8")
 
-# ~1800 символов = 1 страница (14pt, 1.5 интервал)
-CHARS_PER_PAGE = 1800
+PLAN_INSTRUCTIONS = (
+    "Раздели эссе на 3-5 логических разделов: "
+    "введение (актуальность, постановка проблемы), "
+    "2-3 основных тезиса с аргументацией и примерами, "
+    "заключение (выводы, личная позиция). "
+    "Не добавляй список литературы."
+)
 
 
 @dataclass
@@ -23,7 +27,7 @@ class GenerationResult:
     text: str
     title: str
     work_type: str
-    pages_approx: int
+    pages_approx: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
@@ -40,93 +44,34 @@ async def generate(
     font_size: int = 14,
     line_spacing: float = 1.5,
 ) -> GenerationResult:
-    """Сгенерировать эссе/сочинение.
-
-    Args:
-        title: Тема эссе.
-        description: Дополнительное описание/ТЗ от заказчика.
-        subject: Предмет (Философия, Экономика и т.д.).
-        pages: Требуемое количество страниц.
-        methodology_summary: Суммари из методички (если есть).
-        required_uniqueness: Требуемая уникальность (%).
-        font_size: Размер шрифта.
-        line_spacing: Межстрочный интервал.
-    """
-    target_chars = pages * CHARS_PER_PAGE
-    # GPT-4o выдаёт ~4 символа на токен для русского текста
-    max_tokens = min(16000, max(2000, target_chars // 3))
-
-    user_prompt = _build_prompt(
+    """Сгенерировать эссе/сочинение пошагово: план → разделы → расширение."""
+    sw = await stepwise_generate(
+        work_type="Эссе",
         title=title,
         description=description,
         subject=subject,
         pages=pages,
-        target_chars=target_chars,
+        system_prompt=SYSTEM_PROMPT,
+        plan_instructions=PLAN_INSTRUCTIONS,
         methodology_summary=methodology_summary,
         required_uniqueness=required_uniqueness,
-        font_size=font_size,
-        line_spacing=line_spacing,
-    )
-
-    result = await chat_completion(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        model=settings.openai_model_main,
         temperature=0.7,
-        max_tokens=max_tokens,
     )
 
-    text = result["content"]
-    pages_approx = max(1, len(text) // CHARS_PER_PAGE)
+    pages_approx = max(1, len(sw.text) // CHARS_PER_PAGE)
 
     logger.info(
         "Эссе сгенерировано: '%s', ~%d стр., %d токенов, $%.4f",
-        title[:50], pages_approx, result["total_tokens"], result["cost_usd"],
+        title[:50], pages_approx, sw.total_tokens, sw.cost_usd,
     )
 
     return GenerationResult(
-        text=text,
+        text=sw.text,
         title=title,
         work_type="Эссе",
         pages_approx=pages_approx,
-        input_tokens=result["input_tokens"],
-        output_tokens=result["output_tokens"],
-        total_tokens=result["total_tokens"],
-        cost_usd=result["cost_usd"],
+        input_tokens=sw.input_tokens,
+        output_tokens=sw.output_tokens,
+        total_tokens=sw.total_tokens,
+        cost_usd=sw.cost_usd,
     )
-
-
-def _build_prompt(
-    title: str,
-    description: str,
-    subject: str,
-    pages: int,
-    target_chars: int,
-    methodology_summary: Optional[str],
-    required_uniqueness: Optional[int],
-    font_size: int,
-    line_spacing: float,
-) -> str:
-    """Построить промпт для генерации эссе."""
-    parts = [
-        f"Напиши эссе на тему: \"{title}\"",
-        f"Предмет: {subject}" if subject else "",
-        f"Требуемый объём: {pages} страниц ({target_chars} символов с пробелами)",
-        f"Шрифт: {font_size}pt, интервал: {line_spacing}",
-    ]
-
-    if description:
-        parts.append(f"\nДополнительные требования от заказчика:\n{description}")
-
-    if methodology_summary:
-        parts.append(f"\nИнформация из методички:\n{methodology_summary}")
-
-    if required_uniqueness:
-        parts.append(f"\nТребуемая уникальность: не менее {required_uniqueness}%.")
-        parts.append("Пиши максимально оригинальным языком, избегай клише и шаблонных фраз.")
-
-    parts.append("\nНапиши полный текст эссе. Начни сразу с введения, без заголовка \"Эссе\" или \"Введение\".")
-
-    return "\n".join(p for p in parts if p)

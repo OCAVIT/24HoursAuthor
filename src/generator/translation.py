@@ -1,19 +1,23 @@
-"""Генератор переводов текстов."""
+"""Генератор переводов текстов (пошаговая генерация: план → разделы → расширение)."""
 
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from src.ai_client import chat_completion
-from src.config import settings
+from src.generator.stepwise import stepwise_generate, CHARS_PER_PAGE
 
 logger = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 SYSTEM_PROMPT = (PROMPTS_DIR / "translation_system.txt").read_text(encoding="utf-8")
 
-CHARS_PER_PAGE = 1800
+PLAN_INSTRUCTIONS = (
+    "Раздели текст перевода на 3-5 логических частей для последовательного перевода. "
+    "Если текст для перевода содержится в описании — раздели его на фрагменты. "
+    "Если описание содержит только тему — раздели на: введение, 2-3 основных раздела, заключение. "
+    "Если направление перевода не указано — переводи с английского на русский."
+)
 
 
 @dataclass
@@ -39,69 +43,33 @@ async def generate(
     font_size: int = 14,
     line_spacing: float = 1.5,
 ) -> GenerationResult:
-    """Выполнить перевод текста."""
-    target_chars = pages * CHARS_PER_PAGE
-    max_tokens = min(16000, max(2000, target_chars // 3))
-
-    user_prompt = _build_prompt(
+    """Выполнить перевод текста пошагово: план → части → расширение."""
+    sw = await stepwise_generate(
+        work_type="Перевод",
         title=title,
         description=description,
         subject=subject,
+        pages=pages,
+        system_prompt=SYSTEM_PROMPT,
+        plan_instructions=PLAN_INSTRUCTIONS,
         methodology_summary=methodology_summary,
-    )
-
-    result = await chat_completion(
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        model=settings.openai_model_main,
         temperature=0.3,
-        max_tokens=max_tokens,
     )
 
-    text = result["content"]
-    pages_approx = max(1, len(text) // CHARS_PER_PAGE)
+    pages_approx = max(1, len(sw.text) // CHARS_PER_PAGE)
 
     logger.info(
         "Перевод выполнен: '%s', ~%d стр., %d токенов, $%.4f",
-        title[:50], pages_approx, result["total_tokens"], result["cost_usd"],
+        title[:50], pages_approx, sw.total_tokens, sw.cost_usd,
     )
 
     return GenerationResult(
-        text=text,
+        text=sw.text,
         title=title,
         work_type="Перевод",
         pages_approx=pages_approx,
-        input_tokens=result["input_tokens"],
-        output_tokens=result["output_tokens"],
-        total_tokens=result["total_tokens"],
-        cost_usd=result["cost_usd"],
+        input_tokens=sw.input_tokens,
+        output_tokens=sw.output_tokens,
+        total_tokens=sw.total_tokens,
+        cost_usd=sw.cost_usd,
     )
-
-
-def _build_prompt(
-    title: str,
-    description: str,
-    subject: str,
-    methodology_summary: Optional[str],
-) -> str:
-    """Построить промпт для перевода."""
-    parts = [
-        f"Выполни перевод по заданию: \"{title}\"",
-        f"Предметная область: {subject}" if subject else "",
-    ]
-
-    if description:
-        parts.append(f"\nТекст для перевода или описание задания:\n{description}")
-
-    if methodology_summary:
-        parts.append(f"\nДополнительный контекст:\n{methodology_summary}")
-
-    parts.append(
-        "\nЕсли текст для перевода содержится в описании — переведи его. "
-        "Если описание содержит только тему — напиши текст на указанную тему "
-        "и переведи его. Если направление перевода не указано — переведи с английского на русский."
-    )
-
-    return "\n".join(p for p in parts if p)
