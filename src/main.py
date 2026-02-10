@@ -1322,7 +1322,7 @@ async def check_accepted_bids_job() -> None:
 
     from src.scraper.auth import login
     from src.scraper.browser import browser_manager
-    from src.scraper.chat import get_accepted_order_ids
+    from src.scraper.chat import get_accepted_order_ids, get_waiting_confirmation_order_ids, confirm_order
 
     await _track_task()
     _page_locked = False
@@ -1331,7 +1331,43 @@ async def check_accepted_bids_job() -> None:
         await browser_manager.page_lock.acquire()
         _page_locked = True
 
-        # Извлекаем order_id из раздела «Активные» (активные чаты) на /home
+        # --- Шаг 1: Подтверждение заказов «Ждёт подтверждения» ---
+        waiting_ids = await _retry_async(get_waiting_confirmation_order_ids, page)
+        if waiting_ids:
+            await _log_action(
+                "accept",
+                f"Найдено {len(waiting_ids)} заказов «Ждёт подтверждения» — подтверждаем",
+            )
+            for wid in waiting_ids:
+                if _shutting_down or not bot_running:
+                    break
+                try:
+                    await browser_manager.random_delay(min_sec=2, max_sec=5)
+                    confirmed = await _retry_async(confirm_order, page, wid)
+                    if confirmed:
+                        await _log_action("accept", f"Заказ #{wid} подтверждён (кнопка «Подтвердить»)")
+                        # Убеждаемся что заказ в БД и в статусе accepted
+                        order = await _ensure_order_in_db(page, wid, status="accepted")
+                        if order and order.status == "bid_placed":
+                            async with async_session() as session:
+                                await update_order_status(session, order.id, "accepted")
+                    else:
+                        await _log_action(
+                            "error",
+                            f"Не удалось подтвердить заказ #{wid} (кнопка не найдена?)",
+                        )
+                except Exception as e:
+                    logger.warning("Ошибка подтверждения заказа %s: %s", wid, e)
+
+            # Возвращаемся на /home для следующего шага
+            await page.goto(
+                f"{settings.avtor24_base_url}/home",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            await asyncio.sleep(5)
+
+        # --- Шаг 2: Перевод bid_placed → accepted для уже подтверждённых ---
         pending_order_ids = await _retry_async(get_accepted_order_ids, page)
 
         if not pending_order_ids:

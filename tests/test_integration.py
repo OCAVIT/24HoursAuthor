@@ -2110,3 +2110,143 @@ class TestProactiveMessage:
                 mock_page, "90005", order, [],
                 mock_bm, mock_send, mock_generate,
             )
+
+
+class TestWaitingConfirmation:
+    """Тесты подтверждения заказов «Ждёт подтверждения» в check_accepted_bids_job."""
+
+    @pytest.mark.asyncio
+    async def test_confirms_waiting_order(self, int_engine, int_session):
+        """check_accepted_bids_job подтверждает заказы с тегом 'Ждёт подтверждения'."""
+        # Заказ со статусом bid_placed (ставка поставлена, заказчик выбрал но ждёт подтверждения)
+        order = await create_order(
+            int_session,
+            avtor24_id="95001",
+            title="Эссе — ждёт подтверждения",
+            work_type="Эссе",
+            bid_price=1500,
+            status="bid_placed",
+        )
+
+        mock_page = MagicMock()
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://avtor24.ru/home"
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def _retry_passthrough(fn, *a, **kw):
+            return await fn(*a, **kw)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", side_effect=_retry_passthrough), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main._track_task", new_callable=AsyncMock), \
+             patch("src.main._untrack_task", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock) as mock_notif, \
+             patch("src.main.is_banned", return_value=False), \
+             patch("src.main.bot_running", True), \
+             patch("src.main._shutting_down", False), \
+             patch("src.scraper.chat.get_waiting_confirmation_order_ids", new_callable=AsyncMock, return_value=["95001"]) as mock_get_waiting, \
+             patch("src.scraper.chat.confirm_order", new_callable=AsyncMock, return_value=True) as mock_confirm, \
+             patch("src.scraper.chat.get_accepted_order_ids", new_callable=AsyncMock, return_value=[]) as mock_get_accepted, \
+             patch("src.scraper.auth.login", new_callable=AsyncMock, return_value=mock_page), \
+             patch("src.scraper.browser.browser_manager") as mock_bm, \
+             patch("src.main.settings") as mock_settings, \
+             patch("src.main._ensure_order_in_db", new_callable=AsyncMock, return_value=order):
+
+            mock_bm.page_lock = MagicMock()
+            mock_bm.page_lock.acquire = AsyncMock()
+            mock_bm.page_lock.release = MagicMock()
+            mock_bm.random_delay = AsyncMock()
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+
+            from src.main import check_accepted_bids_job
+            await check_accepted_bids_job()
+
+        # confirm_order должен быть вызван
+        mock_confirm.assert_awaited_once_with(mock_page, "95001")
+
+    @pytest.mark.asyncio
+    async def test_skips_confirmation_if_no_waiting(self, int_engine, int_session):
+        """Если нет заказов 'Ждёт подтверждения' — не вызывает confirm_order."""
+        mock_page = MagicMock()
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://avtor24.ru/home"
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def _retry_passthrough(fn, *a, **kw):
+            return await fn(*a, **kw)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", side_effect=_retry_passthrough), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main._track_task", new_callable=AsyncMock), \
+             patch("src.main._untrack_task", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock), \
+             patch("src.main.is_banned", return_value=False), \
+             patch("src.main.bot_running", True), \
+             patch("src.main._shutting_down", False), \
+             patch("src.scraper.chat.get_waiting_confirmation_order_ids", new_callable=AsyncMock, return_value=[]) as mock_get_waiting, \
+             patch("src.scraper.chat.confirm_order", new_callable=AsyncMock) as mock_confirm, \
+             patch("src.scraper.chat.get_accepted_order_ids", new_callable=AsyncMock, return_value=[]), \
+             patch("src.scraper.auth.login", new_callable=AsyncMock, return_value=mock_page), \
+             patch("src.scraper.browser.browser_manager") as mock_bm, \
+             patch("src.main.settings") as mock_settings:
+
+            mock_bm.page_lock = MagicMock()
+            mock_bm.page_lock.acquire = AsyncMock()
+            mock_bm.page_lock.release = MagicMock()
+            mock_bm.random_delay = AsyncMock()
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+
+            from src.main import check_accepted_bids_job
+            await check_accepted_bids_job()
+
+        # confirm_order НЕ вызван
+        mock_confirm.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_confirm_failure_logs_error(self, int_engine, int_session):
+        """Если confirm_order вернул False — логируем ошибку, не падаем."""
+        mock_page = MagicMock()
+        mock_page.goto = AsyncMock()
+        mock_page.url = "https://avtor24.ru/home"
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def _retry_passthrough(fn, *a, **kw):
+            return await fn(*a, **kw)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", side_effect=_retry_passthrough), \
+             patch("src.main._log_action", new_callable=AsyncMock) as mock_log, \
+             patch("src.main._track_task", new_callable=AsyncMock), \
+             patch("src.main._untrack_task", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock), \
+             patch("src.main.is_banned", return_value=False), \
+             patch("src.main.bot_running", True), \
+             patch("src.main._shutting_down", False), \
+             patch("src.scraper.chat.get_waiting_confirmation_order_ids", new_callable=AsyncMock, return_value=["95003"]), \
+             patch("src.scraper.chat.confirm_order", new_callable=AsyncMock, return_value=False), \
+             patch("src.scraper.chat.get_accepted_order_ids", new_callable=AsyncMock, return_value=[]), \
+             patch("src.scraper.auth.login", new_callable=AsyncMock, return_value=mock_page), \
+             patch("src.scraper.browser.browser_manager") as mock_bm, \
+             patch("src.main.settings") as mock_settings, \
+             patch("src.main._ensure_order_in_db", new_callable=AsyncMock, return_value=None):
+
+            mock_bm.page_lock = MagicMock()
+            mock_bm.page_lock.acquire = AsyncMock()
+            mock_bm.page_lock.release = MagicMock()
+            mock_bm.random_delay = AsyncMock()
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+
+            from src.main import check_accepted_bids_job
+            await check_accepted_bids_job()
+
+        # Ошибка залогирована
+        error_logged = any(
+            "Не удалось подтвердить" in str(call)
+            for call in mock_log.call_args_list
+        )
+        assert error_logged

@@ -465,6 +465,38 @@ async def get_accepted_order_ids(page: Page) -> list[str]:
         return []
 
 
+async def get_waiting_confirmation_order_ids(page: Page) -> list[str]:
+    """Получить order_id заказов со статусом «Ждёт подтверждения» на /home.
+
+    Эти заказы требуют нажатия кнопки «Подтвердить» на странице заказа.
+    """
+    try:
+        if not await _navigate_home(page):
+            return []
+
+        items = await _extract_orders_with_tags(
+            page,
+            ["Активные", "активные", "Активные чаты", "активные чаты"],
+        )
+
+        waiting_ids = []
+        for oid, tag in items:
+            tag_lower = tag.lower().strip()
+            if any(wait in tag_lower for wait in _WAITING_TAGS):
+                waiting_ids.append(oid)
+
+        if waiting_ids:
+            logger.info(
+                "Найдено %d заказов «Ждёт подтверждения» на /home",
+                len(waiting_ids),
+            )
+        return waiting_ids
+
+    except Exception as e:
+        logger.error("Ошибка получения заказов «Ждёт подтверждения»: %s", e)
+        return []
+
+
 async def get_active_chats(page: Page) -> list[str]:
     """Получить список order_id с активными чатами (в работе).
 
