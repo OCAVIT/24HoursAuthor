@@ -947,7 +947,10 @@ async def daily_summary_job() -> None:
 # ---------------------------------------------------------------------------
 
 async def check_accepted_bids_job() -> None:
-    """Проверить, приняли ли заказчики наши ставки (перевод bid_placed → accepted)."""
+    """Проверить, приняли ли заказчики наши ставки (перевод bid_placed → accepted).
+
+    Проверяет /home — раздел «Ждут подтверждения» содержит принятые заказы.
+    """
     if not bot_running or _shutting_down:
         return
 
@@ -961,14 +964,13 @@ async def check_accepted_bids_job() -> None:
     try:
         page = await _retry_async(login)
 
-        # Переходим на страницу наших заказов
-        my_orders_url = f"{settings.avtor24_base_url}/cabinet/orders"
+        # Переходим на главную — там раздел "Ждут подтверждения"
+        home_url = f"{settings.avtor24_base_url}/home"
         try:
-            await page.goto(my_orders_url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
         except Exception as nav_err:
             if "ERR_ABORTED" in str(nav_err):
-                # SPA может перенаправить — пробуем дождаться загрузки
-                logger.debug("ERR_ABORTED на /cabinet/orders, ждём загрузки...")
+                logger.debug("ERR_ABORTED на /home, ждём загрузки...")
                 await asyncio.sleep(5)
                 if "/login" in page.url:
                     logger.warning("Сессия истекла при проверке принятых заказов")
@@ -977,95 +979,117 @@ async def check_accepted_bids_job() -> None:
                 raise
         await browser_manager.short_delay()
 
-        # Ищем заказы в статусе "В работе" / "Оплачен"
-        active_items = await page.locator(
-            "[data-order-id], .order-item, .my-order-card"
-        ).all()
+        # Извлекаем order_id из раздела «Ждут подтверждения» через JS
+        pending_order_ids = await page.evaluate("""
+            () => {
+                const root = document.querySelector('#root');
+                if (!root) return [];
 
-        for item in active_items:
+                const ids = [];
+                // Ищем секцию "Ждут подтверждения"
+                let section = null;
+                root.querySelectorAll('h2, h3, [class*="Title"], [class*="Header"], div, span').forEach(el => {
+                    const text = (el.textContent || '').trim();
+                    if (text.includes('Ждут подтверждения') || text.includes('ждут подтверждения')) {
+                        section = el.closest('section, [class*="Section"], [class*="Block"], [class*="Container"]') || el.parentElement;
+                    }
+                });
+
+                // Из найденной секции (или всей страницы) извлекаем ссылки на заказы
+                const container = section || root;
+                container.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
+                    const match = a.href.match(/getoneorder\\/(\\d+)/);
+                    if (match && !ids.includes(match[1])) ids.push(match[1]);
+                });
+
+                // Fallback: если секции не нашли — ищем по тексту всей страницы
+                if (!section) {
+                    // Проверяем все карточки/элементы с текстом "Ждут подтверждения"
+                    const allText = root.innerText || '';
+                    if (allText.includes('Ждут подтверждения')) {
+                        root.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
+                            const match = a.href.match(/getoneorder\\/(\\d+)/);
+                            if (match && !ids.includes(match[1])) ids.push(match[1]);
+                        });
+                    }
+                }
+
+                return ids;
+            }
+        """)
+
+        if not pending_order_ids:
+            return
+
+        await _log_action("accept", f"Найдено {len(pending_order_ids)} заказов в «Ждут подтверждения»")
+
+        for oid in pending_order_ids:
             if _shutting_down or not bot_running:
                 break
+
             try:
-                import re
-                # Извлекаем order_id
-                oid = await item.get_attribute("data-order-id")
-                if not oid:
-                    link = item.locator("a[href*='/order/']")
-                    if await link.count() > 0:
-                        href = await link.first.get_attribute("href")
-                        match = re.search(r"/order/(\d+)", href or "")
-                        oid = match.group(1) if match else None
-
-                if not oid:
-                    continue
-
-                # Проверяем в БД — если bid_placed, значит ещё не обработан
+                # Проверяем в БД — если bid_placed, значит заказчик принял нашу ставку
                 async with async_session() as session:
                     order = await get_order_by_avtor24_id(session, oid)
                 if not order or order.status != "bid_placed":
                     continue
 
-                # Проверяем статус на странице (есть ли "В работе", "Оплачен", и т.д.)
-                status_el = item.locator(".status, .order-status, .badge")
-                if await status_el.count() > 0:
-                    status_text = (await status_el.first.inner_text()).strip().lower()
-                    if any(kw in status_text for kw in ["в работе", "оплачен", "принят", "выполняется"]):
-                        async with async_session() as session:
-                            await update_order_status(session, order.id, "accepted")
+                async with async_session() as session:
+                    await update_order_status(session, order.id, "accepted")
 
-                            today = date.today()
-                            stats = await get_daily_stats(session, today)
-                            await upsert_daily_stats(
-                                session, today,
-                                orders_accepted=(stats.orders_accepted if stats else 0) + 1,
-                            )
+                    today = date.today()
+                    stats = await get_daily_stats(session, today)
+                    await upsert_daily_stats(
+                        session, today,
+                        orders_accepted=(stats.orders_accepted if stats else 0) + 1,
+                    )
 
-                            await push_notification(
-                                session,
-                                type="order_accepted",
-                                title=f"Принят: {order.title[:60]}",
-                                body={"order_id": oid, "title": order.title, "status": "accepted"},
+                    await push_notification(
+                        session,
+                        type="order_accepted",
+                        title=f"Принят: {order.title[:60]}",
+                        body={"order_id": oid, "title": order.title, "status": "accepted"},
+                        order_id=order.id,
+                    )
+
+                await _log_action("accept", f"Заказ #{oid} принят заказчиком", order_id=order.id)
+
+                # Отправляем уточняющее сообщение
+                try:
+                    from src.chat_ai.responder import generate_clarifying_message
+                    from src.scraper.chat import send_message as chat_send_message
+
+                    await browser_manager.random_delay(min_sec=3, max_sec=8)
+                    clarify_msg = await generate_clarifying_message(
+                        work_type=order.work_type or "",
+                        subject=order.subject or "",
+                        title=order.title or "",
+                        description=order.description or "",
+                        required_uniqueness=order.required_uniqueness,
+                        antiplagiat_system=order.antiplagiat_system or "",
+                        bid_price=order.bid_price or 0,
+                    )
+                    if clarify_msg:
+                        send_ok = await chat_send_message(page, oid, clarify_msg.text)
+                        if send_ok:
+                            async with async_session() as session:
+                                await create_message(
+                                    session,
+                                    order_id=order.id,
+                                    direction="outgoing",
+                                    text=clarify_msg.text,
+                                    is_auto_reply=True,
+                                )
+                            await _log_action(
+                                "chat",
+                                f"Уточняющее сообщение отправлено: \"{clarify_msg.text[:100]}\"",
                                 order_id=order.id,
                             )
-
-                        await _log_action("accept", f"Заказ #{oid} принят заказчиком", order_id=order.id)
-
-                        # Отправляем уточняющее сообщение (если не хватает данных)
-                        try:
-                            from src.chat_ai.responder import generate_clarifying_message
-                            from src.scraper.chat import send_message as chat_send_message
-
-                            await browser_manager.random_delay(min_sec=3, max_sec=8)
-                            clarify_msg = await generate_clarifying_message(
-                                work_type=order.work_type or "",
-                                subject=order.subject or "",
-                                title=order.title or "",
-                                description=order.description or "",
-                                required_uniqueness=order.required_uniqueness,
-                                antiplagiat_system=order.antiplagiat_system or "",
-                                bid_price=order.bid_price or 0,
-                            )
-                            if clarify_msg:
-                                send_ok = await chat_send_message(page, oid, clarify_msg.text)
-                                if send_ok:
-                                    async with async_session() as session:
-                                        await create_message(
-                                            session,
-                                            order_id=order.id,
-                                            direction="outgoing",
-                                            text=clarify_msg.text,
-                                            is_auto_reply=True,
-                                        )
-                                    await _log_action(
-                                        "chat",
-                                        f"Уточняющее сообщение отправлено: \"{clarify_msg.text[:100]}\"",
-                                        order_id=order.id,
-                                    )
-                        except Exception as e:
-                            logger.warning("Ошибка отправки уточняющего сообщения: %s", e)
+                except Exception as e:
+                    logger.warning("Ошибка отправки уточняющего сообщения: %s", e)
 
             except Exception as e:
-                logger.warning("Ошибка проверки статуса заказа: %s", e)
+                logger.warning("Ошибка проверки статуса заказа %s: %s", oid, e)
                 continue
 
     except Exception as e:
