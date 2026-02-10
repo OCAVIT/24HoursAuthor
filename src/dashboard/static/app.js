@@ -512,9 +512,17 @@ function dashboard() {
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
 
-            /* Skip if canvas container is hidden (0 dimensions) */
-            const rect = canvas.getBoundingClientRect();
+            const parent = canvas.parentElement;
+            if (!parent) return;
+            const rect = parent.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return;
+
+            /* Set explicit canvas dimensions — responsive:false mode,
+               no ResizeObserver, no async errors on x-show transitions */
+            canvas.style.width = '100%';
+            canvas.style.height = '100%';
+            canvas.width = Math.round(rect.width);
+            canvas.height = Math.round(rect.height);
 
             if (this[storeKey]) { this[storeKey].destroy(); this[storeKey] = null; }
 
@@ -524,7 +532,7 @@ function dashboard() {
                     type,
                     data: { labels, datasets },
                     options: {
-                        responsive: true,
+                        responsive: false,
                         maintainAspectRatio: false,
                         plugins: {
                             legend: { display: isDoughnut, position: 'bottom', labels: { color: '#a1a1aa', padding: 16, font: { size: 11 } } },
