@@ -407,11 +407,11 @@ function dashboard() {
            BOT CONTROL
            ================================================== */
         async toggleBot() {
-            /* Bot start/stop is controlled server-side via the main loop;
-               for now we toggle the flag via settings or a dedicated endpoint.
-               The backend exposes bot_running in stats. We use settings as a proxy. */
-            this.botRunning = !this.botRunning;
-            this.showToast(this.botRunning ? 'Бот запущен' : 'Бот остановлен');
+            const data = await this.api('/api/dashboard/bot/toggle', { method: 'POST' });
+            if (data) {
+                this.botRunning = data.bot_running;
+                this.showToast(this.botRunning ? 'Бот запущен' : 'Бот остановлен');
+            }
         },
 
         logout() {

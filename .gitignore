@@ -51,3 +51,15 @@ Thumbs.db
 .pytest_cache/
 htmlcov/
 .coverage
+
+# Local database
+*.db
+
+# Probe/debug scripts (not needed for deploy)
+scripts/probe_*.py
+scripts/test_output.txt
+scripts/extract_selectors.py
+scripts/full_parse_test.py
+
+# Windows artifacts
+nul

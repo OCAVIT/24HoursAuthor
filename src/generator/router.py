@@ -102,6 +102,12 @@ def is_supported(work_type: str) -> bool:
     return GENERATORS.get(work_type) is not None
 
 
+def is_banned(work_type: str) -> bool:
+    """Проверить, запрещён ли тип работы через конфиг (stop-gate)."""
+    from src.config import settings
+    return work_type in settings.banned_work_types_list
+
+
 def supported_types() -> list[str]:
     """Получить список поддерживаемых типов работ."""
     return [k for k, v in GENERATORS.items() if v is not None]

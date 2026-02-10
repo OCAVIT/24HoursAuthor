@@ -52,6 +52,17 @@ async def get_orders_by_status(session: AsyncSession, status: str) -> list[Order
     return list(result.scalars().all())
 
 
+async def update_order_fields(session: AsyncSession, order_id: int, **kwargs) -> None:
+    """Обновить произвольные поля заказа (без смены статуса)."""
+    stmt = (
+        update(Order)
+        .where(Order.id == order_id)
+        .values(updated_at=func.now(), **kwargs)
+    )
+    await session.execute(stmt)
+    await session.commit()
+
+
 # --- Notifications ---
 
 async def create_notification(

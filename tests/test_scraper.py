@@ -171,162 +171,100 @@ class TestOrderListParsing:
     """Тесты парсинга ленты заказов (мок HTML)."""
 
     def _build_order_list_page(self) -> MagicMock:
-        """Создать мок страницы с 5 заказами."""
+        """Создать мок страницы с 5 заказами.
+
+        Мокает page.evaluate() — JS-based bulk extraction,
+        как реализовано в parse_order_cards().
+        """
         page = MagicMock()
         page.goto = AsyncMock()
         page.wait_for_selector = AsyncMock()
 
-        # Данные заказов из order_list.html
-        orders_data = [
+        # Данные в формате, который возвращает page.evaluate() в orders.py
+        raw_orders = [
             {
-                "data-order-id": "10001",
+                "orderId": "10001",
                 "title": "Курсовая по экономике предприятия",
-                "href": "/order/10001",
-                "work_type": "Курсовая работа",
+                "url": "/order/10001",
+                "workType": "Курсовая работа",
                 "subject": "Экономика",
                 "deadline": "15.02.2026",
-                "time_left": "7 дней",
-                "price": "3 000 ₽",
-                "bids": "2 ставки",
-                "files": "1 файл",
-                "online": True,
-                "badge": "Постоянный клиент",
-                "desc": "Курсовая работа по экономике предприятия, 25-30 страниц...",
+                "filesInfo": "1 файл",
+                "description": "Курсовая работа по экономике предприятия, 25-30 страниц...",
+                "budget": "3 000 ₽",
+                "bidCount": 2,
+                "creationTime": "08.02.2026",
+                "customerOnline": "онлайн",
+                "customerName": "Иван",
+                "badges": ["Постоянный клиент"],
             },
             {
-                "data-order-id": "10002",
+                "orderId": "10002",
                 "title": "Эссе по философии",
-                "href": "/order/10002",
-                "work_type": "Эссе",
+                "url": "/order/10002",
+                "workType": "Эссе",
                 "subject": "Философия",
                 "deadline": "10.02.2026",
-                "time_left": "2 дня",
-                "price": "1 500 ₽",
-                "bids": "0 ставок",
-                "files": "0 файлов",
-                "online": False,
-                "badge": "",
-                "desc": "Эссе на тему \"Свобода и ответственность\"...",
+                "filesInfo": "0 файлов",
+                "description": "Эссе на тему \"Свобода и ответственность\"...",
+                "budget": "1 500 ₽",
+                "bidCount": 0,
+                "creationTime": "07.02.2026",
+                "customerOnline": "",
+                "customerName": "Мария",
+                "badges": [],
             },
             {
-                "data-order-id": "10003",
+                "orderId": "10003",
                 "title": "Реферат по истории России",
-                "href": "/order/10003",
-                "work_type": "Реферат",
+                "url": "/order/10003",
+                "workType": "Реферат",
                 "subject": "История",
                 "deadline": "20.02.2026",
-                "time_left": "12 дней",
-                "price": "1 200 ₽",
-                "bids": "5 ставок",
-                "files": "2 файла",
-                "online": True,
-                "badge": "Быстрый заказ",
-                "desc": "Реферат по истории России XIX века, 15 страниц...",
+                "filesInfo": "2 файла",
+                "description": "Реферат по истории России XIX века, 15 страниц...",
+                "budget": "1 200 ₽",
+                "bidCount": 5,
+                "creationTime": "06.02.2026",
+                "customerOnline": "онлайн",
+                "customerName": "Пётр",
+                "badges": ["Быстрый заказ"],
             },
             {
-                "data-order-id": "10004",
+                "orderId": "10004",
                 "title": "Контрольная по математике",
-                "href": "/order/10004",
-                "work_type": "Контрольная работа",
+                "url": "/order/10004",
+                "workType": "Контрольная работа",
                 "subject": "Математика",
                 "deadline": "09.02.2026",
-                "time_left": "1 день",
-                "price": "800 ₽",
-                "bids": "1 ставка",
-                "files": "1 файл",
-                "online": False,
-                "badge": "",
-                "desc": "10 задач по линейной алгебре...",
+                "filesInfo": "1 файл",
+                "description": "10 задач по линейной алгебре...",
+                "budget": "800 ₽",
+                "bidCount": 1,
+                "creationTime": "08.02.2026",
+                "customerOnline": "",
+                "customerName": "",
+                "badges": [],
             },
             {
-                "data-order-id": "10005",
+                "orderId": "10005",
                 "title": "Дипломная работа по менеджменту",
-                "href": "/order/10005",
-                "work_type": "Дипломная работа",
+                "url": "/order/10005",
+                "workType": "Дипломная работа",
                 "subject": "Менеджмент",
                 "deadline": "01.04.2026",
-                "time_left": "52 дня",
-                "price": "15 000 ₽",
-                "bids": "3 ставки",
-                "files": "3 файла",
-                "online": True,
-                "badge": "Постоянный клиент",
-                "desc": "ВКР по управлению персоналом, 80-100 страниц, антиплагиат 70%...",
+                "filesInfo": "3 файла",
+                "description": "ВКР по управлению персоналом, 80-100 страниц, антиплагиат 70%...",
+                "budget": "15 000 ₽",
+                "bidCount": 3,
+                "creationTime": "05.02.2026",
+                "customerOnline": "онлайн",
+                "customerName": "Елена",
+                "badges": ["Постоянный клиент"],
             },
         ]
 
-        def _make_card_mock(data: dict) -> MagicMock:
-            card = MagicMock()
-            card.get_attribute = AsyncMock(
-                side_effect=lambda attr: data.get(attr, data.get(f"data-{attr}", None))
-            )
-            card.get_attribute = AsyncMock(return_value=data.get("data-order-id"))
-
-            def locator_fn(sel):
-                loc = MagicMock()
-                if "order-title" in sel or "h3" in sel or "h2" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["title"])
-                elif "href*='/order/'" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.get_attribute = AsyncMock(return_value=data["href"])
-                elif "work-type" in sel or "order-type" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["work_type"])
-                elif "subject" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["subject"])
-                elif "deadline" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["deadline"])
-                elif "time-left" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["time_left"])
-                elif "price" in sel or "budget" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["price"])
-                elif "bid-count" in sel or "bids" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["bids"])
-                elif "files-count" in sel or "attachments" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["files"])
-                elif "online" in sel:
-                    loc.count = AsyncMock(return_value=1 if data["online"] else 0)
-                elif "badge" in sel:
-                    loc.count = AsyncMock(return_value=1 if data["badge"] else 0)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["badge"])
-                elif "description" in sel or "desc" in sel:
-                    loc.count = AsyncMock(return_value=1)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value=data["desc"])
-                else:
-                    loc.count = AsyncMock(return_value=0)
-                    loc.first = MagicMock()
-                    loc.first.inner_text = AsyncMock(return_value="")
-                return loc
-
-            card.locator = MagicMock(side_effect=locator_fn)
-            return card
-
-        cards = [_make_card_mock(d) for d in orders_data]
-
-        def page_locator(sel):
-            loc = MagicMock()
-            loc.all = AsyncMock(return_value=cards)
-            return loc
-
-        page.locator = MagicMock(side_effect=page_locator)
+        page.evaluate = AsyncMock(return_value=raw_orders)
         return page
 
     @pytest.mark.asyncio
@@ -366,8 +304,8 @@ class TestOrderListParsing:
         """Бюджеты парсятся корректно."""
         page = self._build_order_list_page()
         orders = await parse_order_cards(page)
-        assert orders[0].budget == 3000
-        assert orders[1].budget == 1500
+        assert orders[0].budget_rub == 3000
+        assert orders[1].budget_rub == 1500
 
     @pytest.mark.asyncio
     async def test_parse_order_list_bids(self):
@@ -383,16 +321,16 @@ class TestOrderListParsing:
         """Онлайн-статус заказчика парсится."""
         page = self._build_order_list_page()
         orders = await parse_order_cards(page)
-        assert orders[0].customer_online is True
-        assert orders[1].customer_online is False
+        assert orders[0].customer_online == "онлайн"
+        assert orders[1].customer_online == ""
 
     @pytest.mark.asyncio
     async def test_parse_order_list_badge(self):
         """Бейдж заказчика парсится."""
         page = self._build_order_list_page()
         orders = await parse_order_cards(page)
-        assert orders[0].customer_badge == "Постоянный клиент"
-        assert orders[2].customer_badge == "Быстрый заказ"
+        assert "Постоянный клиент" in orders[0].customer_badges
+        assert "Быстрый заказ" in orders[2].customer_badges
 
 
 # ===== Тесты парсинга деталей заказа =====
@@ -401,98 +339,43 @@ class TestOrderDetailParsing:
     """Тесты парсинга детальной страницы заказа."""
 
     def _build_detail_page(self) -> MagicMock:
-        """Создать мок страницы с деталями заказа."""
+        """Создать мок страницы с деталями заказа.
+
+        Мокает page.evaluate() — JS-based extraction,
+        как реализовано в fetch_order_detail().
+        """
         page = MagicMock()
         page.goto = AsyncMock()
-        page.wait_for_load_state = AsyncMock()
+        page.wait_for_selector = AsyncMock()
 
-        # Информационные поля
-        info_fields = {
-            "тип работы": "Курсовая работа",
-            "предмет": "Экономика предприятия",
-            "количество страниц": "25-30",
-            "размер шрифта": "14",
-            "межстрочный интервал": "1.5",
-            "требуемая уникальность": "60%",
-            "система антиплагиата": "ETXT Антиплагиат",
-            "срок сдачи": "15.02.2026",
-            "бюджет заказчика": "3 000 ₽",
-            "средняя ставка": "2 800 ₽",
-            "гарантийный срок": "20 дней",
+        raw_detail = {
+            "title": "Курсовая по экономике предприятия",
+            "fields": {
+                "Тип работы": "Курсовая работа",
+                "Предмет": "Экономика предприятия",
+                "Кол-во страниц": "от 25 до 30",
+                "Шрифт": "14",
+                "Интервал": "1.5",
+                "Оригинальность": "60%",
+                "Антиплагиат": "ETXT Антиплагиат",
+                "Срок сдачи": "15.02.2026",
+                "Гарантийный срок": "20 дней",
+            },
+            "budgetText": "3 000 ₽",
+            "description": (
+                "Необходимо написать курсовую работу по экономике предприятия на тему "
+                "\"Анализ финансово-хозяйственной деятельности предприятия\"."
+            ),
+            "customerName": "Иван И.",
+            "customerOnline": "сейчас на сайте",
+            "avgBid": "2 800 ₽",
+            "fileNames": ["методичка.pdf", "требования.docx"],
+            "fileUrls": ["/file/download/55001", "/file/download/55002"],
+            "creationTime": "08.02.2026",
+            "badges": ["Постоянный клиент"],
         }
 
-        def page_locator(sel):
-            loc = MagicMock()
-
-            if "order-title" in sel or "h1" in sel:
-                loc.count = AsyncMock(return_value=1)
-                loc.first = MagicMock()
-                loc.first.inner_text = AsyncMock(return_value="Курсовая по экономике предприятия")
-
-            elif "description" in sel or "task-description" in sel:
-                loc.count = AsyncMock(return_value=1)
-                loc.first = MagicMock()
-                loc.first.inner_text = AsyncMock(return_value=(
-                    "Необходимо написать курсовую работу по экономике предприятия на тему "
-                    "\"Анализ финансово-хозяйственной деятельности предприятия\"."
-                ))
-
-            elif "order-info__row" in sel or "order-param" in sel:
-                # Возвращаем список строк info
-                rows = []
-                for label, value in info_fields.items():
-                    row = MagicMock()
-                    row.inner_text = AsyncMock(return_value=label)
-
-                    # + dd, .value
-                    def make_val_locator(v):
-                        vl = MagicMock()
-                        vl.count = AsyncMock(return_value=1)
-                        vl.first = MagicMock()
-                        vl.first.inner_text = AsyncMock(return_value=v)
-                        return vl
-
-                    row.locator = MagicMock(return_value=make_val_locator(value))
-                    rows.append(row)
-
-                loc.all = AsyncMock(return_value=rows)
-
-            elif "customer-info" in sel or "user-info" in sel:
-                loc.count = AsyncMock(return_value=1)
-                loc.first = MagicMock()
-                loc.first.inner_text = AsyncMock(
-                    return_value="Заказчик: Иван И. | Постоянный клиент | 15 заказов"
-                )
-
-            elif "download" in sel or "file" in sel or "attachment" in sel:
-                # Файлы
-                async def _file_all():
-                    f1 = MagicMock()
-                    f1.get_attribute = AsyncMock(return_value="/file/download/55001")
-                    f2 = MagicMock()
-                    f2.get_attribute = AsyncMock(return_value="/file/download/55002")
-                    return [f1, f2]
-
-                loc.all = _file_all
-
-            elif "breadcrumb" in sel or "work-type-label" in sel:
-                loc.count = AsyncMock(return_value=0)
-
-            elif "subject-label" in sel or "order-subject" in sel:
-                loc.count = AsyncMock(return_value=0)
-
-            elif "order-price" in sel or "price-value" in sel or "budget-value" in sel:
-                loc.count = AsyncMock(return_value=0)
-
-            else:
-                loc.count = AsyncMock(return_value=0)
-                loc.first = MagicMock()
-                loc.first.inner_text = AsyncMock(return_value="")
-                loc.all = AsyncMock(return_value=[])
-
-            return loc
-
-        page.locator = MagicMock(side_effect=page_locator)
+        page.evaluate = AsyncMock(return_value=raw_detail)
         return page
 
     @pytest.mark.asyncio
@@ -558,7 +441,7 @@ class TestOrderDetailParsing:
         with patch("src.scraper.order_detail.browser_manager") as bm:
             bm.short_delay = AsyncMock()
             detail = await fetch_order_detail(page, "https://avtor24.ru/order/10001")
-        assert detail.budget == 3000
+        assert detail.budget_rub == 3000
 
     @pytest.mark.asyncio
     async def test_detail_average_bid(self):
@@ -587,7 +470,7 @@ class TestOrderDetailParsing:
         with patch("src.scraper.order_detail.browser_manager") as bm:
             bm.short_delay = AsyncMock()
             detail = await fetch_order_detail(page, "https://avtor24.ru/order/10001")
-        assert "Иван" in detail.customer_info
+        assert "Иван" in detail.customer_name
 
     @pytest.mark.asyncio
     async def test_detail_description(self):
@@ -753,59 +636,25 @@ class TestChat:
 
     @pytest.mark.asyncio
     async def test_get_messages(self):
-        """Сообщения парсятся из чата."""
+        """Сообщения парсятся из чата (JS evaluate)."""
         page = MagicMock()
+        page.url = "https://avtor24.ru/order/getoneorder/10001"
         page.goto = AsyncMock()
 
-        msg_data = [
-            {"text": "Здравствуйте! Сможете сделать?", "class": "message incoming", "time": "08.02.2026 10:30"},
-            {"text": "Да, тема знакомая, сделаю в срок.", "class": "message outgoing", "time": "08.02.2026 10:45"},
-            {"text": "Методичку прикрепила, посмотрите.", "class": "message incoming", "time": "08.02.2026 11:00"},
+        # get_messages uses page.evaluate() returning list of dicts
+        js_result = [
+            {"text": "Здравствуйте! Сможете сделать?", "isSystem": False, "isOutgoing": False, "timestamp": "10:30"},
+            {"text": "Да, тема знакомая, сделаю в срок.", "isSystem": False, "isOutgoing": True, "timestamp": "10:45"},
+            {"text": "Методичку прикрепила, посмотрите.", "isSystem": False, "isOutgoing": False, "timestamp": "11:00"},
         ]
+        page.evaluate = AsyncMock(return_value=js_result)
 
-        async def _msg_all():
-            mocks = []
-            for md in msg_data:
-                m = MagicMock()
+        # _ensure_chat_tab needs locator
+        chat_tab = MagicMock()
+        chat_tab.count = AsyncMock(return_value=0)
+        page.locator = MagicMock(return_value=chat_tab)
 
-                def make_text_loc(text):
-                    tl = MagicMock()
-                    tl.count = AsyncMock(return_value=1)
-                    tl.first = MagicMock()
-                    tl.first.inner_text = AsyncMock(return_value=text)
-                    return tl
-
-                def make_time_loc(time_str):
-                    tl = MagicMock()
-                    tl.count = AsyncMock(return_value=1)
-                    tl.first = MagicMock()
-                    tl.first.inner_text = AsyncMock(return_value=time_str)
-                    return tl
-
-                def loc_fn(sel, _md=md):
-                    if "text" in sel or "body" in sel:
-                        return make_text_loc(_md["text"])
-                    elif "time" in sel or "timestamp" in sel:
-                        return make_time_loc(_md["time"])
-                    empty = MagicMock()
-                    empty.count = AsyncMock(return_value=0)
-                    return empty
-
-                m.locator = MagicMock(side_effect=loc_fn)
-                m.get_attribute = AsyncMock(return_value=md["class"])
-                mocks.append(m)
-            return mocks
-
-        def page_locator(sel):
-            loc = MagicMock()
-            loc.all = _msg_all
-            return loc
-
-        page.locator = MagicMock(side_effect=page_locator)
-
-        with patch("src.scraper.chat.browser_manager") as bm:
-            bm.short_delay = AsyncMock()
-            messages = await get_messages(page, "10001")
+        messages = await get_messages(page, "10001")
 
         assert len(messages) == 3
         assert messages[0].is_incoming is True
@@ -814,60 +663,56 @@ class TestChat:
 
     @pytest.mark.asyncio
     async def test_send_message_success(self):
-        """Сообщение отправляется."""
+        """Сообщение отправляется (textarea + JS send)."""
         page = MagicMock()
-        page.url = "https://avtor24.ru/order/10001/chat"
+        page.url = "https://avtor24.ru/order/getoneorder/10001"
         page.goto = AsyncMock()
-        page.wait_for_load_state = AsyncMock()
+        # page.evaluate returns True (send button found via JS)
+        page.evaluate = AsyncMock(return_value=True)
 
-        msg_input = MagicMock()
-        msg_input.count = AsyncMock(return_value=1)
-        msg_input.first = MagicMock()
-        msg_input.first.fill = AsyncMock()
+        textarea = MagicMock()
+        textarea.count = AsyncMock(return_value=1)
+        textarea.first = MagicMock()
+        textarea.first.click = AsyncMock()
+        textarea.first.fill = AsyncMock()
+        textarea.first.type = AsyncMock()
 
-        send_btn = MagicMock()
-        send_btn.count = AsyncMock(return_value=1)
-        send_btn.first = MagicMock()
-        send_btn.first.click = AsyncMock()
+        # _ensure_chat_tab: button locator
+        chat_tab = MagicMock()
+        chat_tab.count = AsyncMock(return_value=0)
 
         def page_locator(sel):
-            if "message" in sel or "chat-input" in sel:
-                return msg_input
-            elif "Отправить" in sel or "send" in sel:
-                return send_btn
-            m = MagicMock()
-            m.count = AsyncMock(return_value=0)
-            return m
+            if sel == "textarea":
+                return textarea
+            return chat_tab
 
         page.locator = MagicMock(side_effect=page_locator)
 
-        with patch("src.scraper.chat.browser_manager") as bm:
-            bm.short_delay = AsyncMock()
-            result = await send_message(page, "10001", "Работа готова!")
+        result = await send_message(page, "10001", "Работа готова!")
 
         assert result is True
-        msg_input.first.fill.assert_awaited_once_with("Работа готова!")
-        send_btn.first.click.assert_awaited_once()
+        textarea.first.fill.assert_awaited_once_with("")
+        textarea.first.type.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_send_message_no_input(self):
-        """Отправка не удаётся если нет поля ввода."""
+        """Отправка не удаётся если нет textarea."""
         page = MagicMock()
         page.url = "https://avtor24.ru/other"
         page.goto = AsyncMock()
+        page.evaluate = AsyncMock(return_value=False)
 
         def page_locator(sel):
             m = MagicMock()
             m.count = AsyncMock(return_value=0)
             m.first = MagicMock()
             m.first.fill = AsyncMock()
+            m.first.click = AsyncMock()
             return m
 
         page.locator = MagicMock(side_effect=page_locator)
 
-        with patch("src.scraper.chat.browser_manager") as bm:
-            bm.short_delay = AsyncMock()
-            result = await send_message(page, "10001", "Тест")
+        result = await send_message(page, "10001", "Тест")
 
         assert result is False
 

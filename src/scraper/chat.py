@@ -1,5 +1,10 @@
-"""Чтение и отправка сообщений в чат заказчика на Автор24."""
+"""Чтение и отправка сообщений в чат заказчика на Автор24.
 
+Чат находится на странице заказа: /order/getoneorder/{order_id}
+Это React SPA со styled-components.
+"""
+
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -20,38 +25,238 @@ class ChatMessage:
     text: str
     is_incoming: bool  # True = от заказчика, False = от нас
     timestamp: Optional[str] = None
+    is_system: bool = False  # "Вы сделали ставку", "Вас выбрали автором" и т.д.
+
+
+def _order_page_url(order_id: str) -> str:
+    """URL страницы заказа (где живёт чат)."""
+    return f"{settings.avtor24_base_url}/order/getoneorder/{order_id}"
+
+
+async def _ensure_order_page(page: Page, order_id: str) -> None:
+    """Убедиться что мы на странице нужного заказа."""
+    current = page.url
+    if f"/order/getoneorder/{order_id}" not in current:
+        await page.goto(_order_page_url(order_id),
+                        wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(5)
+
+
+async def _ensure_chat_tab(page: Page) -> None:
+    """Кликнуть на вкладку 'Чат с заказчиком' если не активна."""
+    try:
+        chat_tab = page.locator('button:has-text("Чат с заказчиком")')
+        if await chat_tab.count() > 0:
+            await chat_tab.first.click()
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+
+
+async def get_order_page_info(page: Page, order_id: str) -> dict:
+    """Извлечь информацию со страницы заказа (статус, чат, кнопки).
+
+    Returns dict с ключами:
+      - accepted: bool (Вас выбрали автором)
+      - has_confirm_btn: bool (кнопка Подтвердить)
+      - has_bid_form: bool
+      - has_chat: bool
+      - messages: list[dict]
+      - page_text: str
+    """
+    await _ensure_order_page(page, order_id)
+    await _ensure_chat_tab(page)
+    await asyncio.sleep(2)
+
+    return await page.evaluate("""
+        () => {
+            const root = document.querySelector('#root');
+            if (!root) return {error: 'no root'};
+
+            const fullText = root.innerText || '';
+
+            // Статус
+            const accepted = fullText.includes('Вас выбрали автором');
+            const hasConfirmBtn = !!root.querySelector('button:has(div)');
+            let confirmBtnFound = false;
+            root.querySelectorAll('button').forEach(btn => {
+                if ((btn.innerText || '').trim() === 'Подтвердить') confirmBtnFound = true;
+            });
+            const hasBidForm = !!root.querySelector('#MakeOffer__inputBid');
+            const hasChat = !!root.querySelector('textarea');
+
+            // Извлекаем сообщения из чата
+            const messages = [];
+            const groupItems = root.querySelectorAll('[class*="GroupItem"]');
+            groupItems.forEach(item => {
+                const text = (item.innerText || '').trim();
+                if (!text) return;
+
+                // Системные сообщения
+                const isSystem = !!item.querySelector('[class*="MessageSystemStyled"]');
+
+                // Определяем направление: исходящие = наши сообщения
+                // На Avtor24 исходящие обычно справа (имеют другой styled)
+                const msgBase = item.querySelector('[class*="MessageBaseStyled"]');
+                let isOutgoing = false;
+                if (msgBase) {
+                    const cls = msgBase.className || '';
+                    // Проверяем наличие класса, указывающего на исходящее
+                    // Обычно исходящие имеют другой цвет/расположение
+                    // Ищем по классу или по parent контейнеру
+                    const parent = msgBase.closest('[class*="GroupStyled"]');
+                    if (parent) {
+                        // Если есть аватар с нашим именем или метка "Вы"
+                        const parentText = parent.innerText || '';
+                        // Исходящие обычно не имеют имени заказчика
+                    }
+                }
+
+                // Время
+                let timestamp = '';
+                const timeEl = item.querySelector('[class*="Time"], time, [class*="timestamp"]');
+                if (timeEl) timestamp = (timeEl.innerText || '').trim();
+
+                messages.push({
+                    text: text.substring(0, 2000),
+                    isSystem,
+                    isOutgoing,
+                    timestamp,
+                });
+            });
+
+            return {
+                accepted,
+                hasConfirmBtn: confirmBtnFound,
+                hasBidForm,
+                hasChat,
+                messages,
+                pageText: fullText.substring(0, 3000),
+            };
+        }
+    """)
+
+
+async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
+    """Получить историю сообщений чата заказа."""
+    try:
+        await _ensure_order_page(page, order_id)
+        await _ensure_chat_tab(page)
+        await asyncio.sleep(2)
+
+        raw = await page.evaluate("""
+            () => {
+                const root = document.querySelector('#root');
+                if (!root) return [];
+
+                const messages = [];
+                const items = root.querySelectorAll('[class*="GroupItem"]');
+
+                items.forEach(item => {
+                    const text = (item.innerText || '').trim();
+                    if (!text) return;
+
+                    const isSystem = !!item.querySelector('[class*="MessageSystemStyled"]');
+
+                    // Определяем направление
+                    // На Avtor24: у исходящих сообщений MessageBaseStyled
+                    // имеет другой стиль/цвет (обычно синий/серый)
+                    const msgBase = item.querySelector('[class*="MessageBaseStyled"]');
+                    let isOutgoing = false;
+
+                    if (msgBase && !isSystem) {
+                        // Проверяем наличие класса для исходящих
+                        const cls = msgBase.className || '';
+                        // Ищем специфичные стили для outgoing
+                        // Обычно содержат "Out" или имеют другой вариант styled
+                        if (cls.includes('Out') || cls.includes('My') || cls.includes('Author')) {
+                            isOutgoing = true;
+                        }
+
+                        // Альтернатива: проверяем computed style (цвет фона)
+                        const style = window.getComputedStyle(msgBase);
+                        const bg = style.backgroundColor;
+                        // Исходящие обычно имеют синий/голубой фон
+                        if (bg && (bg.includes('66') || bg.includes('33') || bg.includes('99'))) {
+                            isOutgoing = true;
+                        }
+                    }
+
+                    let timestamp = '';
+                    const timeEl = item.querySelector('[class*="Time"]');
+                    if (timeEl) timestamp = (timeEl.innerText || '').trim();
+
+                    messages.push({
+                        text: text.substring(0, 2000),
+                        isSystem,
+                        isOutgoing,
+                        timestamp,
+                    });
+                });
+
+                return messages;
+            }
+        """)
+
+        result = []
+        for msg in raw:
+            if msg.get("isSystem"):
+                result.append(ChatMessage(
+                    order_id=order_id,
+                    text=msg["text"],
+                    is_incoming=False,
+                    timestamp=msg.get("timestamp"),
+                    is_system=True,
+                ))
+            else:
+                result.append(ChatMessage(
+                    order_id=order_id,
+                    text=msg["text"],
+                    is_incoming=not msg.get("isOutgoing", False),
+                    timestamp=msg.get("timestamp"),
+                ))
+
+        return result
+
+    except Exception as e:
+        logger.error("Ошибка получения сообщений для заказа %s: %s", order_id, e)
+        return []
 
 
 async def get_active_chats(page: Page) -> list[str]:
-    """Получить список order_id с новыми сообщениями."""
+    """Получить список order_id с новыми сообщениями.
+
+    Проверяет /home на наличие активных чатов с непрочитанными.
+    """
     try:
-        my_orders_url = f"{settings.avtor24_base_url}/cabinet/orders"
-        await page.goto(my_orders_url, wait_until="domcontentloaded", timeout=30000)
-        await browser_manager.short_delay()
+        home_url = f"{settings.avtor24_base_url}/home"
+        await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(5)
 
-        # Ищем заказы с непрочитанными сообщениями
-        order_ids: list[str] = []
-        unread_items = await page.locator(
-            ".unread-message, .new-message, .has-new-messages, "
-            "[data-unread-count]:not([data-unread-count='0'])"
-        ).all()
+        order_ids = await page.evaluate("""
+            () => {
+                const root = document.querySelector('#root');
+                if (!root) return [];
 
-        for item in unread_items:
-            # Ищем ссылку на заказ в родительском элементе
-            parent = item.locator("xpath=ancestor::*[contains(@data-order-id, '')]")
-            if await parent.count() > 0:
-                oid = await parent.first.get_attribute("data-order-id")
-                if oid:
-                    order_ids.append(oid)
-                    continue
+                const ids = [];
+                // Ищем ссылки на заказы в чатах
+                root.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
+                    const match = a.href.match(/getoneorder\\/(\\d+)/);
+                    if (match) ids.push(match[1]);
+                });
 
-            # Или ищем ссылку
-            link = item.locator("a[href*='/order/']")
-            if await link.count() > 0:
-                href = await link.first.get_attribute("href")
-                match = re.search(r"/order/(\d+)", href or "")
-                if match:
-                    order_ids.append(match.group(1))
+                // Также проверяем элементы с unread индикаторами
+                root.querySelectorAll('[class*="ChatItem"], [class*="Chat"]').forEach(el => {
+                    const link = el.querySelector('a[href*="/order/"]');
+                    if (link) {
+                        const match = link.href.match(/getoneorder\\/(\\d+)/);
+                        if (match && !ids.includes(match[1])) ids.push(match[1]);
+                    }
+                });
+
+                return ids;
+            }
+        """)
 
         logger.info("Найдено %d чатов с новыми сообщениями", len(order_ids))
         return order_ids
@@ -61,87 +266,47 @@ async def get_active_chats(page: Page) -> list[str]:
         return []
 
 
-async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
-    """Получить историю сообщений чата заказа."""
-    try:
-        chat_url = f"{settings.avtor24_base_url}/order/{order_id}/chat"
-        await page.goto(chat_url, wait_until="domcontentloaded", timeout=30000)
-        await browser_manager.short_delay()
-
-        messages: list[ChatMessage] = []
-        msg_items = await page.locator(
-            ".message, .chat-message, .msg-item"
-        ).all()
-
-        for msg_el in msg_items:
-            try:
-                text_el = msg_el.locator(".message-text, .msg-text, .msg-body, p")
-                text = (await text_el.first.inner_text()).strip() if await text_el.count() > 0 else ""
-                if not text:
-                    continue
-
-                # Определяем направление: входящее/исходящее
-                classes = await msg_el.get_attribute("class") or ""
-                is_incoming = any(
-                    kw in classes for kw in ["incoming", "from-customer", "received", "left"]
-                )
-
-                # Время
-                time_el = msg_el.locator(".message-time, .msg-time, time, .timestamp")
-                timestamp = None
-                if await time_el.count() > 0:
-                    timestamp = (await time_el.first.inner_text()).strip()
-
-                messages.append(ChatMessage(
-                    order_id=order_id,
-                    text=text,
-                    is_incoming=is_incoming,
-                    timestamp=timestamp,
-                ))
-            except Exception:
-                continue
-
-        return messages
-
-    except Exception as e:
-        logger.error("Ошибка получения сообщений для заказа %s: %s", order_id, e)
-        return []
-
-
 async def send_message(page: Page, order_id: str, text: str) -> bool:
-    """Отправить сообщение в чат заказа."""
-    try:
-        chat_url = f"{settings.avtor24_base_url}/order/{order_id}/chat"
-        current = page.url
-        if f"/order/{order_id}" not in current:
-            await page.goto(chat_url, wait_until="domcontentloaded", timeout=30000)
-            await browser_manager.short_delay()
+    """Отправить сообщение в чат заказа.
 
-        # Поле ввода сообщения
-        msg_input = page.locator(
-            'textarea[name="message"], textarea.chat-input, '
-            '#message-input, .msg-input textarea, textarea[placeholder*="сообщен"]'
-        )
+    Использует textarea на странице /order/getoneorder/{order_id}.
+    Печатает текст с имитацией набора (type вместо fill) для естественности.
+    """
+    try:
+        await _ensure_order_page(page, order_id)
+        await _ensure_chat_tab(page)
+        await asyncio.sleep(1)
+
+        # Поле ввода: textarea с placeholder "Ваш ответ"
+        msg_input = page.locator('textarea')
         if await msg_input.count() == 0:
-            logger.error("Не найдено поле ввода сообщения для заказа %s", order_id)
+            logger.error("Не найден textarea для заказа %s", order_id)
             return False
 
-        await msg_input.first.fill(text)
-        await browser_manager.short_delay()
+        await msg_input.first.click()
+        await asyncio.sleep(0.5)
 
-        # Кнопка отправки
-        send_btn = page.locator(
-            'button:has-text("Отправить"), button.send-btn, '
-            'input[type="submit"], .chat-send-btn'
-        )
-        if await send_btn.count() > 0:
-            await send_btn.first.click()
-        else:
-            # Отправка по Enter
-            await msg_input.first.press("Enter")
+        # Имитация набора текста (type с задержкой между символами)
+        await msg_input.first.fill("")  # очистить
+        await msg_input.first.type(text, delay=30)  # ~30мс между символами
+        await asyncio.sleep(1)
 
-        await page.wait_for_load_state("domcontentloaded", timeout=10000)
-        await browser_manager.short_delay()
+        # Отправка через JS (кнопка может быть скрыта Playwright'ом)
+        sent = await page.evaluate("""
+            () => {
+                let btn = document.querySelector('[data-testid="dialogMessageInput-action_sendMsg"]');
+                if (btn) { btn.click(); return true; }
+                btn = document.querySelector('[class*="SendAction"]');
+                if (btn) { btn.click(); return true; }
+                return false;
+            }
+        """)
+
+        if not sent:
+            # Fallback: Ctrl+Enter
+            await msg_input.first.press("Control+Enter")
+
+        await asyncio.sleep(2)
 
         logger.info("Сообщение отправлено в чат заказа %s", order_id)
         return True
@@ -151,16 +316,92 @@ async def send_message(page: Page, order_id: str, text: str) -> bool:
         return False
 
 
+async def confirm_order(page: Page, order_id: str) -> bool:
+    """Нажать 'Подтвердить' на странице заказа (подтвердить начало работы).
+
+    После нажатия первой кнопки появляется модальное окно
+    "Вы уверены, что хотите подтвердить начало работы..." —
+    нужно нажать подтверждение и в модалке тоже.
+    """
+    try:
+        await _ensure_order_page(page, order_id)
+        await asyncio.sleep(2)
+
+        # Ищем кнопку "Подтвердить" на странице
+        confirm_btn = page.locator('button:has-text("Подтвердить")')
+        if await confirm_btn.count() == 0:
+            logger.warning("Кнопка 'Подтвердить' не найдена для заказа %s", order_id)
+            return False
+
+        await confirm_btn.first.click()
+        await asyncio.sleep(2)
+
+        # После клика появляется модальное окно подтверждения
+        # Ищем кнопку подтверждения в модалке (data-testid="alertModal")
+        modal_confirm = page.locator('[data-testid*="alertModal"] button:has-text("Подтвердить")')
+        if await modal_confirm.count() > 0:
+            await modal_confirm.first.click()
+            logger.info("Нажата кнопка подтверждения в модалке для заказа %s", order_id)
+            await asyncio.sleep(3)
+        else:
+            # Попробуем найти любую кнопку "Подтвердить" / "Да" в оверлее
+            modal_yes = page.locator(
+                '[class*="Modal"] button:has-text("Подтвердить"), '
+                '[class*="Modal"] button:has-text("Да"), '
+                '[class*="Overlay"] ~ * button:has-text("Подтвердить"), '
+                '[class*="dialog"] button:has-text("Подтвердить")'
+            )
+            if await modal_yes.count() > 0:
+                await modal_yes.first.click()
+                await asyncio.sleep(3)
+            else:
+                # Последняя попытка: вторая кнопка "Подтвердить" на странице
+                all_confirm = page.locator('button:has-text("Подтвердить")')
+                count = await all_confirm.count()
+                if count > 1:
+                    await all_confirm.nth(1).click()
+                    await asyncio.sleep(3)
+
+        # Убедимся что модалка закрылась
+        await _dismiss_any_overlay(page)
+
+        logger.info("Заказ %s подтверждён (нажата 'Подтвердить')", order_id)
+        return True
+
+    except Exception as e:
+        logger.error("Ошибка подтверждения заказа %s: %s", order_id, e)
+        return False
+
+
+async def _dismiss_any_overlay(page: Page) -> None:
+    """Закрыть модальные окна/оверлеи если есть."""
+    try:
+        overlay = page.locator('[class*="Overlay"]')
+        if await overlay.count() > 0:
+            # Попробуем нажать Escape
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+
+
 async def send_file_with_message(
-    page: Page, order_id: str, filepath: str, message: str
+    page: Page, order_id: str, filepath: str, message: str,
+    variant: str = "final",
 ) -> bool:
-    """Загрузить файл и отправить сопроводительное сообщение."""
+    """Загрузить файл через 'Загрузить работу' и отправить сопроводительное сообщение.
+
+    Файл загружается через штатную кнопку (Промежуточный/Окончательный),
+    затем отдельно отправляется текстовое сообщение в чат.
+    """
     from pathlib import Path
     from src.scraper.file_handler import upload_file
 
-    file_ok = await upload_file(page, order_id, Path(filepath))
+    file_ok = await upload_file(page, order_id, Path(filepath), variant=variant)
     if not file_ok:
         return False
 
+    # Отправляем сопроводительное сообщение отдельно
+    await asyncio.sleep(2)
     msg_ok = await send_message(page, order_id, message)
     return msg_ok

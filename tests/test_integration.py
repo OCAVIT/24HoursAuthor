@@ -438,20 +438,28 @@ class TestGenerationDeliveryCycle:
             antiplagiat_system="textru",
         )
 
-        # Мок генерации эссе
-        mock_text = "Проблема свободы воли является одной из центральных в философии. " * 100
+        # Мок генерации эссе (essay → stepwise → chat_completion/json)
+        mock_section_text = "Проблема свободы воли является одной из центральных в философии. " * 100
+        mock_plan = {
+            "data": {"sections": [
+                {"name": "Введение", "target_words": 300},
+                {"name": "Основная часть", "target_words": 600},
+                {"name": "Заключение", "target_words": 300},
+            ]},
+            "input_tokens": 200, "output_tokens": 100, "cost_usd": 0.001,
+        }
+        mock_text_resp = {
+            "content": mock_section_text,
+            "model": "gpt-4o",
+            "input_tokens": 2000,
+            "output_tokens": 8000,
+            "total_tokens": 10000,
+            "cost_usd": 0.085,
+        }
 
-        with patch("src.generator.essay.chat_completion") as mock_gen, \
+        with patch("src.generator.stepwise.chat_completion_json", new_callable=AsyncMock, return_value=mock_plan), \
+             patch("src.generator.stepwise.chat_completion", new_callable=AsyncMock, return_value=mock_text_resp), \
              patch("src.antiplagiat.textru.check") as mock_plagiarism:
-
-            mock_gen.return_value = {
-                "content": mock_text,
-                "model": "gpt-4o",
-                "input_tokens": 2000,
-                "output_tokens": 8000,
-                "total_tokens": 10000,
-                "cost_usd": 0.085,
-            }
 
             # Генерация
             from src.generator.essay import generate
@@ -462,7 +470,7 @@ class TestGenerationDeliveryCycle:
                 pages=order.pages_max or 5,
             )
 
-            assert result.text == mock_text
+            assert len(result.text) > 100
             assert result.pages_approx >= 1
             assert result.cost_usd > 0
 
@@ -559,19 +567,28 @@ class TestGenerationDeliveryCycle:
 
     async def test_generate_and_check_integration(self, int_session):
         """Тест generate_and_check из роутера — полный цикл с мок."""
-        mock_text = "Текст курсовой работы по экономике. " * 200
+        mock_section_text = "Текст курсовой работы по экономике. " * 200
+        mock_plan = {
+            "data": {"sections": [
+                {"name": "Введение", "target_words": 300},
+                {"name": "Основная часть", "target_words": 600},
+                {"name": "Заключение", "target_words": 300},
+            ]},
+            "input_tokens": 200, "output_tokens": 100, "cost_usd": 0.001,
+        }
+        mock_text_resp = {
+            "content": mock_section_text,
+            "model": "gpt-4o",
+            "input_tokens": 3000,
+            "output_tokens": 10000,
+            "total_tokens": 13000,
+            "cost_usd": 0.11,
+        }
 
-        with patch("src.generator.essay.chat_completion") as mock_gen, \
+        with patch("src.generator.stepwise.chat_completion_json", new_callable=AsyncMock, return_value=mock_plan), \
+             patch("src.generator.stepwise.chat_completion", new_callable=AsyncMock, return_value=mock_text_resp), \
              patch("src.antiplagiat.textru.check") as mock_check:
 
-            mock_gen.return_value = {
-                "content": mock_text,
-                "model": "gpt-4o",
-                "input_tokens": 3000,
-                "output_tokens": 10000,
-                "total_tokens": 13000,
-                "cost_usd": 0.11,
-            }
             mock_check.return_value = 72.0
 
             from src.generator.router import generate_and_check
@@ -586,7 +603,7 @@ class TestGenerationDeliveryCycle:
             )
 
             assert gen_result is not None
-            assert gen_result.text == mock_text
+            assert len(gen_result.text) > 100
             assert check_result is not None
             assert check_result.uniqueness == 72.0
             assert check_result.is_sufficient is True

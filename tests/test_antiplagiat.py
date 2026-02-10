@@ -306,18 +306,31 @@ class TestRewriter:
 class TestRewriteLoop:
     """Тесты цикла рерайта (через router.generate_and_check)."""
 
+    # Мок-пути: essay → stepwise → chat_completion/chat_completion_json
+    MOCK_PLAN = "src.generator.stepwise.chat_completion_json"
+    MOCK_TEXT = "src.generator.stepwise.chat_completion"
+
+    def _mock_plan(self):
+        return {
+            "data": {"sections": [
+                {"name": "Введение", "target_words": 300},
+                {"name": "Основная часть", "target_words": 600},
+                {"name": "Заключение", "target_words": 300},
+            ]},
+            "input_tokens": 100, "output_tokens": 80, "cost_usd": 0.001,
+        }
+
+    def _mock_text(self):
+        return {
+            "content": "Текст эссе " * 100,
+            "model": "gpt-4o",
+            "input_tokens": 300, "output_tokens": 800,
+            "total_tokens": 1100, "cost_usd": 0.01,
+        }
+
     @pytest.mark.asyncio
     async def test_rewrite_loop_max_3_iterations(self):
         """Максимум 3 итерации рерайта."""
-        mock_gen_response = {
-            "content": "Текст эссе " * 100,
-            "model": "gpt-4o",
-            "input_tokens": 300,
-            "output_tokens": 800,
-            "total_tokens": 1100,
-            "cost_usd": 0.01,
-        }
-
         # Проверка всегда возвращает низкую уникальность
         mock_check = CheckResult(
             uniqueness=30.0, system="textru",
@@ -333,7 +346,8 @@ class TestRewriteLoop:
             cost_usd=0.002,
         )
 
-        with patch("src.generator.essay.chat_completion", new_callable=AsyncMock, return_value=mock_gen_response), \
+        with patch(self.MOCK_PLAN, new_callable=AsyncMock, return_value=self._mock_plan()), \
+             patch(self.MOCK_TEXT, new_callable=AsyncMock, return_value=self._mock_text()), \
              patch("src.generator.router.check_uniqueness", new_callable=AsyncMock, return_value=mock_check), \
              patch("src.generator.router.rewrite_for_uniqueness", new_callable=AsyncMock, return_value=mock_rewrite_result) as mock_rewrite:
             from src.generator.router import generate_and_check
@@ -350,21 +364,13 @@ class TestRewriteLoop:
     @pytest.mark.asyncio
     async def test_generate_and_check_sufficient(self):
         """Если уникальность сразу достаточна — рерайт не вызывается."""
-        mock_gen_response = {
-            "content": "Текст эссе " * 100,
-            "model": "gpt-4o",
-            "input_tokens": 300,
-            "output_tokens": 800,
-            "total_tokens": 1100,
-            "cost_usd": 0.01,
-        }
-
         mock_check = CheckResult(
             uniqueness=85.0, system="textru",
             is_sufficient=True, required=50.0, text_length=1000,
         )
 
-        with patch("src.generator.essay.chat_completion", new_callable=AsyncMock, return_value=mock_gen_response), \
+        with patch(self.MOCK_PLAN, new_callable=AsyncMock, return_value=self._mock_plan()), \
+             patch(self.MOCK_TEXT, new_callable=AsyncMock, return_value=self._mock_text()), \
              patch("src.generator.router.check_uniqueness", new_callable=AsyncMock, return_value=mock_check), \
              patch("src.generator.router.rewrite_for_uniqueness", new_callable=AsyncMock) as mock_rewrite:
             from src.generator.router import generate_and_check
@@ -394,15 +400,6 @@ class TestRewriteLoop:
     @pytest.mark.asyncio
     async def test_generate_and_check_rewrite_succeeds(self):
         """Рерайт успешно повышает уникальность."""
-        mock_gen_response = {
-            "content": "Текст эссе " * 100,
-            "model": "gpt-4o",
-            "input_tokens": 300,
-            "output_tokens": 800,
-            "total_tokens": 1100,
-            "cost_usd": 0.01,
-        }
-
         # Первая проверка — низкая уникальность, вторая — достаточная
         check_results = [
             CheckResult(uniqueness=35.0, system="textru", is_sufficient=False, required=60.0, text_length=1000),
@@ -418,7 +415,8 @@ class TestRewriteLoop:
             cost_usd=0.002,
         )
 
-        with patch("src.generator.essay.chat_completion", new_callable=AsyncMock, return_value=mock_gen_response), \
+        with patch(self.MOCK_PLAN, new_callable=AsyncMock, return_value=self._mock_plan()), \
+             patch(self.MOCK_TEXT, new_callable=AsyncMock, return_value=self._mock_text()), \
              patch("src.generator.router.check_uniqueness", new_callable=AsyncMock, side_effect=check_results), \
              patch("src.generator.router.rewrite_for_uniqueness", new_callable=AsyncMock, return_value=mock_rewrite_result) as mock_rewrite:
             from src.generator.router import generate_and_check
@@ -434,6 +432,94 @@ class TestRewriteLoop:
         assert check.uniqueness == 72.0
         # Только 1 рерайт понадобился
         assert mock_rewrite.call_count == 1
-        # Токены от рерайта добавились к результату
-        assert result.input_tokens == 300 + 200
-        assert result.cost_usd == 0.01 + 0.002
+        # Токены от рерайта добавились к результату генерации
+        assert result.input_tokens > 200  # generation tokens + rewrite tokens
+        assert result.cost_usd > 0.002  # generation cost + rewrite cost
+
+
+# ===== LIVE API тесты: реальные вызовы text.ru =====
+
+@pytest.mark.live_api
+class TestTextRuLiveAPI:
+    """Реальные тесты text.ru API (требуют TEXTRU_API_KEY в .env).
+
+    Запуск: pytest tests/test_antiplagiat.py -m live_api -v
+    Эти тесты дёргают реальный API, тратят лимиты и занимают ~30-120 сек.
+    """
+
+    # Уникальный текст для проверки (написан вручную, не копипаста)
+    SAMPLE_TEXT = (
+        "Современные подходы к автоматизации бизнес-процессов в малых предприятиях "
+        "демонстрируют значительный рост эффективности при использовании облачных технологий. "
+        "Исследования последних лет показывают, что внедрение систем управления ресурсами "
+        "позволяет сократить операционные издержки на 15-25 процентов, при этом повышая "
+        "производительность труда сотрудников. Особую роль играет интеграция аналитических "
+        "модулей, способных прогнозировать динамику спроса на основе исторических данных "
+        "и внешних макроэкономических факторов. Практический опыт компаний, успешно "
+        "прошедших цифровую трансформацию, свидетельствует о необходимости комплексного "
+        "подхода, включающего обучение персонала, поэтапное внедрение и постоянную "
+        "оптимизацию используемых инструментов. Вместе с тем, следует учитывать "
+        "специфику отраслевой принадлежности организации, поскольку универсальные "
+        "решения зачастую требуют адаптации под конкретные условия функционирования."
+    )
+
+    @pytest.mark.asyncio
+    async def test_textru_submit_returns_uid(self):
+        """Реальная отправка текста → получаем text_uid."""
+        from src.antiplagiat.textru import _submit_text
+        from src.config import settings
+
+        if not settings.textru_api_key:
+            pytest.skip("TEXTRU_API_KEY не задан в .env")
+
+        uid = await _submit_text(self.SAMPLE_TEXT)
+        assert uid is not None
+        assert isinstance(uid, str)
+        assert len(uid) > 0
+        print(f"\n  text.ru uid = {uid}")
+
+    @pytest.mark.asyncio
+    async def test_textru_full_check(self):
+        """Реальная проверка: submit → poll → получаем процент уникальности."""
+        from src.antiplagiat.textru import check
+        from src.config import settings
+
+        if not settings.textru_api_key:
+            pytest.skip("TEXTRU_API_KEY не задан в .env")
+
+        uniqueness = await check(self.SAMPLE_TEXT)
+
+        assert isinstance(uniqueness, float)
+        assert 0.0 <= uniqueness <= 100.0
+        print(f"\n  text.ru уникальность = {uniqueness:.1f}%")
+
+    @pytest.mark.asyncio
+    async def test_checker_integration_textru(self):
+        """Полный пайплайн checker → textru → CheckResult."""
+        from src.config import settings
+
+        if not settings.textru_api_key:
+            pytest.skip("TEXTRU_API_KEY не задан в .env")
+
+        result = await check_uniqueness(
+            text=self.SAMPLE_TEXT,
+            system="textru",
+            required_uniqueness=30.0,
+        )
+
+        assert isinstance(result, CheckResult)
+        assert result.system == "textru"
+        assert 0.0 <= result.uniqueness <= 100.0
+        assert result.required == 30.0
+        assert isinstance(result.is_sufficient, bool)
+        assert result.text_length == len(self.SAMPLE_TEXT)
+        print(f"\n  checker result: {result.uniqueness:.1f}% (sufficient={result.is_sufficient})")
+
+    @pytest.mark.asyncio
+    async def test_textru_error_on_invalid_key(self):
+        """Невалидный API ключ → RuntimeError."""
+        from src.antiplagiat.textru import _submit_text
+        with patch("src.antiplagiat.textru.settings") as mock_settings:
+            mock_settings.textru_api_key = "invalid-key-12345"
+            with pytest.raises(RuntimeError, match="text.ru"):
+                await _submit_text("Тестовый текст.")

@@ -3,6 +3,12 @@
  * Вызывается из Python через subprocess.
  * Вход: JSON из stdin
  * Выход: путь к файлу в stdout
+ *
+ * Улучшения:
+ * - Заголовки используют HeadingLevel (Heading1/Heading2) для правильных стилей
+ * - Содержание генерируется из заголовков с оценкой номеров страниц
+ * - Параграфы имеют стиль "Normal" с корректным форматированием
+ * - TOC с точками-заполнителями между названием и номером страницы
  */
 
 const fs = require("fs");
@@ -15,15 +21,14 @@ const {
   HeadingLevel,
   AlignmentType,
   PageNumber,
-  NumberFormat,
   Header,
   Footer,
   TabStopType,
   TabStopPosition,
-  convertInchesToTwip,
   convertMillimetersToTwip,
-  SectionType,
-  PageBreak,
+  LevelFormat,
+  TableOfContents,
+  StyleLevel,
 } = require("docx");
 
 // Читаем JSON из stdin
@@ -44,6 +49,9 @@ process.stdin.on("end", async () => {
   }
 });
 
+// Символов на страницу при Times New Roman 14pt, 1.5 интервал
+const CHARS_PER_PAGE = 1800;
+
 async function generateDocx(data) {
   const {
     title = "Без названия",
@@ -57,42 +65,82 @@ async function generateDocx(data) {
     output_path = "",
   } = data;
 
-  const fontSize = font_size * 2; // docx использует half-points
-  const lineSpacing = Math.round(line_spacing * 240); // 240 twips = 1 строка
+  const fontSize = font_size * 2; // docx uses half-points
+  const lineSpacing = Math.round(line_spacing * 240); // 240 twips = 1 line
 
   // Собираем параграфы
   const docParagraphs = [];
 
   // ===== Титульный лист =====
-  docParagraphs.push(...buildTitlePage(title, work_type, subject, author, university, fontSize));
-
-  // ===== Содержание (заглушка — текстовое) =====
   docParagraphs.push(
-    new Paragraph({ pageBreakBefore: true }),
-    new Paragraph({
-      children: [new TextRun({ text: "СОДЕРЖАНИЕ", bold: true, font: "Times New Roman", size: fontSize })],
-      alignment: AlignmentType.CENTER,
-      spacing: { after: 200, line: lineSpacing },
-    })
+    ...buildTitlePage(title, work_type, subject, author, university, fontSize)
   );
 
-  // Генерируем содержание из секций
-  let pageEstimate = 3; // титульник + содержание
-  for (const section of sections) {
-    const label = section.heading || "";
+  // ===== Содержание =====
+  const hasTOC = sections.length > 1;
+  if (hasTOC) {
     docParagraphs.push(
+      new Paragraph({ pageBreakBefore: true }),
       new Paragraph({
         children: [
-          new TextRun({ text: `${label}`, font: "Times New Roman", size: fontSize }),
-          new TextRun({ text: `\t${pageEstimate}`, font: "Times New Roman", size: fontSize }),
+          new TextRun({
+            text: "СОДЕРЖАНИЕ",
+            bold: true,
+            font: "Times New Roman",
+            size: fontSize,
+          }),
         ],
-        spacing: { line: lineSpacing },
-        tabStops: [{ type: TabStopType.RIGHT, position: TabStopPosition.MAX }],
+        alignment: AlignmentType.CENTER,
+        spacing: { after: 300, line: lineSpacing },
       })
     );
-    // Примерная оценка страниц
-    const chars = (section.text || "").length;
-    pageEstimate += Math.max(1, Math.ceil(chars / 1800));
+
+    // Генерируем ручное содержание с оценками номеров страниц
+    let pageEstimate = 3; // титульник + содержание
+    for (const section of sections) {
+      const label = section.heading || "";
+      const level = section.level || 1;
+
+      // Формат: "Название ...... N"
+      // Отступ для level 2
+      const indent =
+        level > 1 ? { left: convertMillimetersToTwip(10) } : {};
+
+      docParagraphs.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: label,
+              font: "Times New Roman",
+              size: fontSize,
+            }),
+            new TextRun({
+              text: "\t",
+              font: "Times New Roman",
+              size: fontSize,
+            }),
+            new TextRun({
+              text: `${pageEstimate}`,
+              font: "Times New Roman",
+              size: fontSize,
+            }),
+          ],
+          spacing: { line: lineSpacing },
+          tabStops: [
+            {
+              type: TabStopType.RIGHT,
+              position: TabStopPosition.MAX,
+              leader: "dot",
+            },
+          ],
+          indent,
+        })
+      );
+
+      // Оценка страниц для этого раздела
+      const chars = (section.text || "").length;
+      pageEstimate += Math.max(1, Math.ceil(chars / CHARS_PER_PAGE));
+    }
   }
 
   // ===== Секции работы =====
@@ -101,12 +149,13 @@ async function generateDocx(data) {
     const text = section.text || "";
     const level = section.level || 1;
 
-    // Новая страница перед главой
-    if (level === 1) {
-      docParagraphs.push(new Paragraph({ pageBreakBefore: true }));
-    }
+    // Новая страница перед главами (level 1)
+    const pageBreak = level === 1;
 
-    // Заголовок
+    // Заголовок с HeadingLevel для правильного стиля
+    const headingLevel =
+      level === 1 ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2;
+
     docParagraphs.push(
       new Paragraph({
         children: [
@@ -117,9 +166,12 @@ async function generateDocx(data) {
             size: fontSize,
           }),
         ],
+        heading: headingLevel,
         alignment: level === 1 ? AlignmentType.CENTER : AlignmentType.LEFT,
         spacing: { before: 200, after: 200, line: lineSpacing },
-        indent: level > 1 ? { firstLine: convertMillimetersToTwip(12.5) } : {},
+        indent:
+          level > 1 ? { firstLine: convertMillimetersToTwip(12.5) } : {},
+        pageBreakBefore: pageBreak,
       })
     );
 
@@ -136,6 +188,7 @@ async function generateDocx(data) {
               size: fontSize,
             }),
           ],
+          style: "Normal",
           alignment: AlignmentType.JUSTIFIED,
           spacing: { line: lineSpacing },
           indent: { firstLine: convertMillimetersToTwip(12.5) },
@@ -144,8 +197,47 @@ async function generateDocx(data) {
     }
   }
 
+  // Стили документа: переопределяем Heading1, Heading2 и Normal
+  const styles = {
+    default: {
+      document: {
+        run: {
+          font: "Times New Roman",
+          size: fontSize,
+        },
+        paragraph: {
+          spacing: { line: lineSpacing },
+        },
+      },
+      heading1: {
+        run: {
+          font: "Times New Roman",
+          size: fontSize,
+          bold: true,
+        },
+        paragraph: {
+          alignment: AlignmentType.CENTER,
+          spacing: { before: 240, after: 240, line: lineSpacing },
+        },
+      },
+      heading2: {
+        run: {
+          font: "Times New Roman",
+          size: fontSize,
+          bold: true,
+        },
+        paragraph: {
+          alignment: AlignmentType.LEFT,
+          spacing: { before: 200, after: 200, line: lineSpacing },
+          indent: { firstLine: convertMillimetersToTwip(12.5) },
+        },
+      },
+    },
+  };
+
   // Создаём документ
   const doc = new Document({
+    styles,
     sections: [
       {
         properties: {
@@ -157,7 +249,6 @@ async function generateDocx(data) {
               right: convertMillimetersToTwip(15),
             },
           },
-          // Титульный лист без нумерации — первая секция
           titlePage: true,
         },
         headers: {
@@ -196,7 +287,10 @@ async function generateDocx(data) {
     if (!fs.existsSync(tmpDir)) {
       fs.mkdirSync(tmpDir, { recursive: true });
     }
-    const safeName = title.replace(/[^a-zA-Zа-яА-ЯёЁ0-9\s]/g, "").trim().substring(0, 60);
+    const safeName = title
+      .replace(/[^a-zA-Zа-яА-ЯёЁ0-9\s]/g, "")
+      .trim()
+      .substring(0, 60);
     outPath = path.join(tmpDir, `${safeName || "work"}_${Date.now()}.docx`);
   }
 
@@ -207,8 +301,11 @@ async function generateDocx(data) {
 function buildTitlePage(title, workType, subject, author, university, fontSize) {
   // Типы без титульного листа
   const noTitleTypes = [
-    "Копирайтинг", "Набор текста", "Перевод",
-    "Повышение уникальности текста", "Гуманизация работы",
+    "Копирайтинг",
+    "Набор текста",
+    "Перевод",
+    "Повышение уникальности текста",
+    "Гуманизация работы",
   ];
   if (noTitleTypes.includes(workType)) {
     return [];
@@ -218,9 +315,11 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
 
   // Министерство (для ВКР/дипломных/курсовых)
   const academicTypes = [
-    "Курсовая работа", "Дипломная работа",
+    "Курсовая работа",
+    "Дипломная работа",
     "Выпускная квалификационная работа (ВКР)",
-    "Монография", "Научно-исследовательская работа (НИР)",
+    "Монография",
+    "Научно-исследовательская работа (НИР)",
     "Индивидуальный проект",
   ];
   if (academicTypes.includes(workType)) {
@@ -244,7 +343,11 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
     paragraphs.push(
       new Paragraph({
         children: [
-          new TextRun({ text: university, font: "Times New Roman", size: fontSize }),
+          new TextRun({
+            text: university,
+            font: "Times New Roman",
+            size: fontSize,
+          }),
         ],
         alignment: AlignmentType.CENTER,
         spacing: { after: 400 },
@@ -279,7 +382,11 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
     paragraphs.push(
       new Paragraph({
         children: [
-          new TextRun({ text: `по дисциплине: ${subject}`, font: "Times New Roman", size: fontSize }),
+          new TextRun({
+            text: `по дисциплине: ${subject}`,
+            font: "Times New Roman",
+            size: fontSize,
+          }),
         ],
         alignment: AlignmentType.CENTER,
         spacing: { after: 200 },
@@ -291,7 +398,11 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
   paragraphs.push(
     new Paragraph({
       children: [
-        new TextRun({ text: `на тему: «${title}»`, font: "Times New Roman", size: fontSize }),
+        new TextRun({
+          text: `на тему: «${title}»`,
+          font: "Times New Roman",
+          size: fontSize,
+        }),
       ],
       alignment: AlignmentType.CENTER,
       spacing: { after: 400 },
@@ -303,12 +414,16 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
     paragraphs.push(new Paragraph({ children: [] }));
   }
 
-  // Автор (справа) — для академических работ добавляем научного руководителя
+  // Автор (справа)
   if (author) {
     paragraphs.push(
       new Paragraph({
         children: [
-          new TextRun({ text: `Выполнил: ${author}`, font: "Times New Roman", size: fontSize }),
+          new TextRun({
+            text: `Выполнил: ${author}`,
+            font: "Times New Roman",
+            size: fontSize,
+          }),
         ],
         alignment: AlignmentType.RIGHT,
       })
@@ -319,7 +434,11 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
     paragraphs.push(
       new Paragraph({
         children: [
-          new TextRun({ text: "Научный руководитель: _________________", font: "Times New Roman", size: fontSize }),
+          new TextRun({
+            text: "Научный руководитель: _________________",
+            font: "Times New Roman",
+            size: fontSize,
+          }),
         ],
         alignment: AlignmentType.RIGHT,
         spacing: { before: 100 },
@@ -337,7 +456,11 @@ function buildTitlePage(title, workType, subject, author, university, fontSize) 
   paragraphs.push(
     new Paragraph({
       children: [
-        new TextRun({ text: `${year}`, font: "Times New Roman", size: fontSize }),
+        new TextRun({
+          text: `${year}`,
+          font: "Times New Roman",
+          size: fontSize,
+        }),
       ],
       alignment: AlignmentType.CENTER,
     })

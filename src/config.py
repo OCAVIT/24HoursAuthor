@@ -46,6 +46,16 @@ class Settings(BaseSettings):
     speed_limit_min_delay: int = 30
     speed_limit_max_delay: int = 120
 
+    # Stop-gate: запрещённые типы работ (через запятую)
+    banned_work_types: str = ""
+
+    @property
+    def banned_work_types_list(self) -> list[str]:
+        """Парсинг строки banned_work_types в список."""
+        if not self.banned_work_types:
+            return []
+        return [t.strip() for t in self.banned_work_types.split(",") if t.strip()]
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

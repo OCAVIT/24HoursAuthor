@@ -577,3 +577,43 @@ async def test_static_not_found():
         response = await client.get("/dashboard/static/nonexistent.txt")
 
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Bot Toggle
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_bot_toggle(seeded_session, patch_db, patch_auth):
+    """POST /api/dashboard/bot/toggle → переключение бота."""
+    import src.main as main_module
+    original = main_module.bot_running
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        cookies = await _get_auth_cookie(client, patch_auth)
+        client.cookies.update(cookies)
+
+        # Первое переключение
+        response = await client.post("/api/dashboard/bot/toggle")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["bot_running"] == (not original)
+
+        # Второе переключение — обратно
+        response2 = await client.post("/api/dashboard/bot/toggle")
+        data2 = response2.json()
+        assert data2["bot_running"] == original
+
+    # Восстановить исходное состояние
+    main_module.bot_running = original
+
+
+@pytest.mark.asyncio
+async def test_bot_toggle_unauthorized(patch_auth):
+    """POST /api/dashboard/bot/toggle без авторизации → 401."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/api/dashboard/bot/toggle")
+    assert response.status_code == 401

@@ -82,6 +82,59 @@ async def chat_completion(
     }
 
 
+async def chat_completion_vision(
+    messages: list[dict],
+    model: Optional[str] = None,
+    temperature: float = 0.3,
+    max_tokens: int = 2048,
+) -> dict:
+    """Вызвать OpenAI Chat Completion с поддержкой изображений (vision).
+
+    Messages могут содержать content в формате списка:
+    [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}]
+
+    Returns:
+        {
+            "content": str,
+            "model": str,
+            "input_tokens": int,
+            "output_tokens": int,
+            "total_tokens": int,
+            "cost_usd": float,
+        }
+    """
+    # Vision работает с gpt-4o
+    model = model or settings.openai_model_main
+
+    response = await client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    usage = response.usage
+    input_tokens = usage.prompt_tokens if usage else 0
+    output_tokens = usage.completion_tokens if usage else 0
+    cost = calculate_cost(model, input_tokens, output_tokens)
+
+    content = response.choices[0].message.content or ""
+
+    logger.info(
+        "OpenAI Vision %s: %d in / %d out tokens, $%.4f",
+        model, input_tokens, output_tokens, cost,
+    )
+
+    return {
+        "content": content,
+        "model": model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "cost_usd": cost,
+    }
+
+
 async def chat_completion_json(
     messages: list[dict],
     model: Optional[str] = None,

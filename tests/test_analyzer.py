@@ -360,3 +360,229 @@ class TestApiUsageTracking:
         )
         assert usage.order_id == order.id
         assert usage.cost_usd == 0.06
+
+
+# ===== Тесты file_analyzer: vision / image detection =====
+
+class TestFileAnalyzerVision:
+    """Тесты обработки изображений и vision API."""
+
+    def test_is_image_file_png(self, tmp_path):
+        """PNG определяется как изображение."""
+        from src.analyzer.file_analyzer import is_image_file
+        assert is_image_file(tmp_path / "test.png") is True
+
+    def test_is_image_file_jpg(self, tmp_path):
+        """JPG определяется как изображение."""
+        from src.analyzer.file_analyzer import is_image_file
+        assert is_image_file(tmp_path / "test.jpg") is True
+
+    def test_is_image_file_jpeg(self, tmp_path):
+        """JPEG определяется как изображение."""
+        from src.analyzer.file_analyzer import is_image_file
+        assert is_image_file(tmp_path / "test.jpeg") is True
+
+    def test_is_image_file_heic(self, tmp_path):
+        """HEIC определяется как изображение."""
+        from src.analyzer.file_analyzer import is_image_file
+        assert is_image_file(tmp_path / "test.heic") is True
+
+    def test_is_image_file_pdf_not_image(self, tmp_path):
+        """PDF НЕ является изображением."""
+        from src.analyzer.file_analyzer import is_image_file
+        assert is_image_file(tmp_path / "test.pdf") is False
+
+    def test_is_image_file_docx_not_image(self, tmp_path):
+        """DOCX НЕ является изображением."""
+        from src.analyzer.file_analyzer import is_image_file
+        assert is_image_file(tmp_path / "test.docx") is False
+
+    def test_is_image_file_txt_not_image(self, tmp_path):
+        """TXT НЕ является изображением."""
+        from src.analyzer.file_analyzer import is_image_file
+        assert is_image_file(tmp_path / "readme.txt") is False
+
+    @pytest.mark.asyncio
+    async def test_extract_all_content_text_only(self, tmp_path):
+        """extract_all_content с текстовым файлом — без vision."""
+        from src.analyzer.file_analyzer import extract_all_content
+        txt_file = tmp_path / "test.txt"
+        txt_file.write_text("Тестовый контент файла.", encoding="utf-8")
+        result = await extract_all_content([txt_file])
+        assert "Тестовый контент" in result.text
+        assert result.total_cost_usd == 0.0
+        assert result.vision_texts == []
+
+    @pytest.mark.asyncio
+    async def test_extract_all_content_empty_list(self):
+        """extract_all_content с пустым списком — пустой результат."""
+        from src.analyzer.file_analyzer import extract_all_content
+        result = await extract_all_content([])
+        assert result.text == ""
+        assert result.vision_texts == []
+        assert result.total_cost_usd == 0.0
+
+    @pytest.mark.asyncio
+    async def test_extract_all_content_image_calls_vision(self, tmp_path):
+        """extract_all_content с изображением вызывает vision API."""
+        from src.analyzer.file_analyzer import extract_all_content
+        img_file = tmp_path / "test.png"
+        img_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
+
+        mock_vision = {
+            "text": "Текст с изображения",
+            "input_tokens": 500,
+            "output_tokens": 100,
+            "cost_usd": 0.005,
+        }
+
+        with patch("src.analyzer.file_analyzer.extract_text_from_image", new_callable=AsyncMock, return_value=mock_vision):
+            result = await extract_all_content([img_file])
+
+        assert len(result.vision_texts) == 1
+        assert "Текст с изображения" in result.vision_texts[0]
+        assert result.total_cost_usd == 0.005
+
+    def test_extract_text_returns_empty_for_images(self, tmp_path):
+        """extract_text возвращает пустую строку для изображений."""
+        img_file = tmp_path / "photo.jpg"
+        img_file.write_bytes(b"\xff\xd8\xff" + b"\x00" * 50)
+        result = extract_text(img_file)
+        assert result == ""
+
+
+# ===== Тесты field_extractor =====
+
+class TestFieldExtractor:
+    """Тесты извлечения недостающих полей из описания/файлов."""
+
+    @pytest.mark.asyncio
+    async def test_extract_fills_empty_pages(self):
+        """Пустые pages заполняются из описания."""
+        from src.analyzer.field_extractor import extract_missing_fields
+        order = OrderDetail(
+            order_id="100", title="Тест", url="https://test.com",
+            description="Курсовая работа 25-30 страниц, уникальность 70%",
+        )
+
+        mock_response = {
+            "data": {"pages_min": 25, "pages_max": 30, "required_uniqueness": 70},
+            "input_tokens": 100, "output_tokens": 50, "cost_usd": 0.0005,
+        }
+
+        with patch("src.analyzer.field_extractor.chat_completion_json", new_callable=AsyncMock, return_value=mock_response):
+            result = await extract_missing_fields(order)
+
+        assert result.order.pages_min == 25
+        assert result.order.pages_max == 30
+        assert result.order.required_uniqueness == 70
+        assert "pages_min" in result.fields_extracted
+        assert "pages_max" in result.fields_extracted
+        assert result.order.extracted_from_files is True
+
+    @pytest.mark.asyncio
+    async def test_extract_preserves_existing_fields(self):
+        """Уже заполненные поля НЕ перезаписываются."""
+        from src.analyzer.field_extractor import extract_missing_fields
+        order = OrderDetail(
+            order_id="101", title="Тест", url="https://test.com",
+            description="Реферат 15-20 стр",
+            pages_min=10, pages_max=15, required_uniqueness=60,
+        )
+
+        mock_response = {
+            "data": {"pages_min": 20, "pages_max": 25, "required_uniqueness": 80},
+            "input_tokens": 100, "output_tokens": 50, "cost_usd": 0.0005,
+        }
+
+        with patch("src.analyzer.field_extractor.chat_completion_json", new_callable=AsyncMock, return_value=mock_response):
+            result = await extract_missing_fields(order)
+
+        # Existing values NOT overwritten
+        assert result.order.pages_min == 10
+        assert result.order.pages_max == 15
+        assert result.order.required_uniqueness == 60
+        assert "pages_min" not in result.fields_extracted
+
+    @pytest.mark.asyncio
+    async def test_extract_no_missing_fields(self):
+        """Все поля заполнены — API не вызывается."""
+        from src.analyzer.field_extractor import extract_missing_fields
+        order = OrderDetail(
+            order_id="102", title="Тест", url="https://test.com",
+            pages_min=10, pages_max=15,
+            required_uniqueness=60,
+            antiplagiat_system="ETXT",
+            font_size=12,
+            line_spacing=2.0,
+            formatting_requirements="TNR 12",
+            structure="Введение, Глава 1, Заключение",
+            special_requirements="Методичка прилагается",
+        )
+
+        result = await extract_missing_fields(order)
+        assert result.fields_extracted == []
+        assert result.input_tokens == 0  # No API call made
+
+    @pytest.mark.asyncio
+    async def test_extract_empty_description_and_no_files(self):
+        """Пустое описание и нет файлов — API не вызывается."""
+        from src.analyzer.field_extractor import extract_missing_fields
+        order = OrderDetail(
+            order_id="103", title="Тест", url="https://test.com",
+            description="",
+        )
+        result = await extract_missing_fields(order, files_text="")
+        assert result.fields_extracted == []
+
+    @pytest.mark.asyncio
+    async def test_extract_fills_formatting_requirements(self):
+        """Требования к оформлению извлекаются из текста."""
+        from src.analyzer.field_extractor import extract_missing_fields
+        order = OrderDetail(
+            order_id="104", title="Тест", url="https://test.com",
+            description="Требования: шрифт Times New Roman 12, интервал 1.0",
+        )
+
+        mock_response = {
+            "data": {
+                "font_size": 12,
+                "line_spacing": 1.0,
+                "formatting_requirements": "Times New Roman 12pt, интервал 1.0",
+            },
+            "input_tokens": 100, "output_tokens": 50, "cost_usd": 0.0005,
+        }
+
+        with patch("src.analyzer.field_extractor.chat_completion_json", new_callable=AsyncMock, return_value=mock_response):
+            result = await extract_missing_fields(order)
+
+        assert result.order.font_size == 12
+        assert result.order.line_spacing == 1.0
+        assert "Times New Roman" in result.order.formatting_requirements
+        assert result.order.extracted_from_files is True
+
+    @pytest.mark.asyncio
+    async def test_extract_with_files_text(self):
+        """Текст файлов передаётся в GPT вместе с описанием."""
+        from src.analyzer.field_extractor import extract_missing_fields
+        order = OrderDetail(
+            order_id="105", title="Тест", url="https://test.com",
+            description="Курсовая работа",
+        )
+
+        mock_response = {
+            "data": {"pages_min": 25, "structure": "Введение, 3 главы, Заключение"},
+            "input_tokens": 200, "output_tokens": 80, "cost_usd": 0.001,
+        }
+
+        with patch("src.analyzer.field_extractor.chat_completion_json", new_callable=AsyncMock, return_value=mock_response) as mock_call:
+            result = await extract_missing_fields(
+                order, files_text="Методичка: минимум 25 страниц, 3 главы"
+            )
+
+        assert result.order.pages_min == 25
+        assert "structure" in result.fields_extracted
+        # Проверяем что files_text был передан в промпт
+        call_args = mock_call.call_args
+        user_msg = call_args[1]["messages"][1]["content"] if "messages" in call_args[1] else call_args[0][0][1]["content"]
+        assert "Методичка" in str(user_msg)

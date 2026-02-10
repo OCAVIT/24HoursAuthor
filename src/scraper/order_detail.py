@@ -13,6 +13,66 @@ from src.scraper.browser import browser_manager
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Категории типов работ — определяют какие поля доступны на сайте
+# ---------------------------------------------------------------------------
+
+WORK_TYPE_CATEGORIES: dict[str, dict] = {
+    "writing": {
+        "types": [
+            "Эссе", "Сочинение", "Реферат", "Доклад", "Курсовая работа",
+            "Дипломная работа", "Выпускная квалификационная работа (ВКР)",
+            "Статья", "Автореферат", "Аннотация",
+            "Научно-исследовательская работа (НИР)", "Индивидуальный проект",
+            "Маркетинговое исследование", "Бизнес-план", "Отчёт по практике",
+            "Рецензия", "Вычитка и рецензирование работ", "Творческая работа",
+            "Статья ВАК/Scopus", "Лабораторная работа", "Презентации",
+            "Монография",
+        ],
+        "fields": ["pages", "font_size", "line_spacing", "uniqueness", "antiplagiat", "budget"],
+    },
+    "copywriting": {
+        "types": [
+            "Копирайтинг", "Набор текста", "Повышение уникальности текста",
+            "Гуманизация работы",
+        ],
+        "fields": ["char_count", "uniqueness", "budget"],
+    },
+    "tasks": {
+        "types": [
+            "Решение задач", "Контрольная работа", "Ответы на вопросы",
+            "Задача по программированию",
+        ],
+        "fields": ["budget"],
+    },
+    "other": {
+        "types": [],  # fallback
+        "fields": ["budget"],
+    },
+}
+
+# Быстрый lookup: work_type → category name
+_WORK_TYPE_TO_CATEGORY: dict[str, str] = {}
+for _cat_name, _cat_data in WORK_TYPE_CATEGORIES.items():
+    for _wt in _cat_data["types"]:
+        _WORK_TYPE_TO_CATEGORY[_wt] = _cat_name
+
+
+def get_work_type_category(work_type: str) -> str:
+    """Определить категорию типа работы."""
+    return _WORK_TYPE_TO_CATEGORY.get(work_type, "other")
+
+
+def get_category_fields(work_type: str) -> list[str]:
+    """Получить список полей, доступных для данного типа работы."""
+    cat = get_work_type_category(work_type)
+    return WORK_TYPE_CATEGORIES[cat]["fields"]
+
+
+# ---------------------------------------------------------------------------
+# Dataclass
+# ---------------------------------------------------------------------------
+
 @dataclass
 class OrderDetail:
     """Полная информация о заказе."""
@@ -37,6 +97,11 @@ class OrderDetail:
     customer_badges: list[str] = field(default_factory=list)
     creation_time: str = ""
     file_names: list[str] = field(default_factory=list)
+    file_urls: list[str] = field(default_factory=list)
+    formatting_requirements: str = ""
+    structure: str = ""
+    special_requirements: str = ""
+    extracted_from_files: bool = False
 
 
 def _extract_int(text: str) -> Optional[int]:
@@ -157,17 +222,24 @@ async def fetch_order_detail(page: Page, order_url: str) -> OrderDetail:
             let avgBidEl = root.querySelector('[class*="AvgBid"]');
             let avgBid = avgBidEl ? avgBidEl.textContent.trim() : '';
 
-            // Файлы
+            // Файлы: имена + URL-ы для скачивания
             let fileNames = [];
+            let fileUrls = [];
             root.querySelectorAll('[class*="ItemStyled"]').forEach(item => {
                 // ItemStyled содержит: номер, иконку расширения, имя файла, размер
                 let texts = item.innerText.split('\\n').map(s => s.trim()).filter(Boolean);
                 // Ищем имя файла (обычно 3-й элемент, содержит расширение)
                 for (let t of texts) {
-                    if (/\\.(docx?|pdf|xlsx?|pptx?|txt|zip|rar|jpg|png|csv)$/i.test(t)) {
+                    if (/\\.(docx?|pdf|xlsx?|pptx?|txt|zip|rar|jpg|jpeg|png|heic|csv)$/i.test(t)) {
                         fileNames.push(t);
                         break;
                     }
+                }
+                // Ищем ссылку на скачивание
+                let link = item.querySelector('a[href]');
+                if (link) {
+                    let href = link.getAttribute('href');
+                    if (href) fileUrls.push(href);
                 }
             });
 
@@ -191,6 +263,7 @@ async def fetch_order_detail(page: Page, order_url: str) -> OrderDetail:
                 customerOnline,
                 avgBid,
                 fileNames,
+                fileUrls,
                 creationTime,
                 badges,
             };
@@ -208,49 +281,57 @@ async def fetch_order_detail(page: Page, order_url: str) -> OrderDetail:
     subject = fields.get("Предмет", "")
     deadline = fields.get("Срок сдачи", None)
 
-    # Страницы: "Минимальный объём" (e.g. "20 стр") или "Кол-во страниц" (e.g. "от 10 до 20")
+    # Определяем категорию для graceful field handling
+    available_fields = get_category_fields(work_type) if work_type else ["pages", "font_size", "line_spacing", "uniqueness", "antiplagiat", "budget"]
+
+    # Страницы — только если категория предусматривает
     pages_min, pages_max = None, None
-    pages_text = fields.get("Кол-во страниц", "") or fields.get("Минимальный объём", "")
-    if pages_text:
-        pages_min, pages_max = _parse_pages(pages_text)
-    # Если Кол-во страниц не нашлось, но есть Минимальный объём отдельно
-    if pages_min is None:
-        min_vol = fields.get("Минимальный объём", "")
-        if min_vol:
-            num = _extract_int(min_vol)
-            if num:
-                pages_min = num
+    if "pages" in available_fields:
+        pages_text = fields.get("Кол-во страниц", "") or fields.get("Минимальный объём", "")
+        if pages_text:
+            pages_min, pages_max = _parse_pages(pages_text)
+        if pages_min is None:
+            min_vol = fields.get("Минимальный объём", "")
+            if min_vol:
+                num = _extract_int(min_vol)
+                if num:
+                    pages_min = num
 
-    # Шрифт (e.g. "14")
+    # Шрифт
     font_size = 14
-    font_text = fields.get("Шрифт", "")
-    if font_text:
-        size = _extract_int(font_text)
-        if size:
-            font_size = size
+    if "font_size" in available_fields:
+        font_text = fields.get("Шрифт", "")
+        if font_text:
+            size = _extract_int(font_text)
+            if size:
+                font_size = size
 
-    # Интервал (e.g. "1.5" или "1,5")
+    # Интервал
     line_spacing = 1.5
-    spacing_text = fields.get("Интервал", "")
-    if spacing_text:
-        sp = _extract_float(spacing_text)
-        if sp:
-            line_spacing = sp
+    if "line_spacing" in available_fields:
+        spacing_text = fields.get("Интервал", "")
+        if spacing_text:
+            sp = _extract_float(spacing_text)
+            if sp:
+                line_spacing = sp
 
-    # Оригинальность (e.g. "от 60%")
+    # Оригинальность
     required_uniqueness = None
-    uniq_text = fields.get("Оригинальность", "")
-    if uniq_text:
-        required_uniqueness = _extract_int(uniq_text)
+    if "uniqueness" in available_fields:
+        uniq_text = fields.get("Оригинальность", "")
+        if uniq_text:
+            required_uniqueness = _extract_int(uniq_text)
 
-    # Антиплагиат (e.g. "ETXT" или "Антиплагиат.ру")
-    antiplagiat_system = fields.get("Антиплагиат", "")
+    # Антиплагиат
+    antiplagiat_system = ""
+    if "antiplagiat" in available_fields:
+        antiplagiat_system = fields.get("Антиплагиат", "")
 
-    # Бюджет
+    # Бюджет — всегда парсим
     budget_text = raw.get("budgetText", "")
     budget_rub = _extract_int(budget_text) if budget_text else None
 
-    # Средняя ставка (e.g. "Средняя ставка 1 429₽")
+    # Средняя ставка
     avg_bid_text = raw.get("avgBid", "")
     average_bid = _extract_int(avg_bid_text) if avg_bid_text else None
 
@@ -276,4 +357,5 @@ async def fetch_order_detail(page: Page, order_url: str) -> OrderDetail:
         customer_badges=raw.get("badges", []),
         creation_time=raw.get("creationTime", ""),
         file_names=raw.get("fileNames", []),
+        file_urls=raw.get("fileUrls", []),
     )

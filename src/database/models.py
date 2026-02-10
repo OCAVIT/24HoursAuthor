@@ -47,6 +47,12 @@ class Order(Base):
     api_cost_usd = Column(Float)
     api_tokens_used = Column(Integer)
 
+    # Доп. поля (извлечённые из описания/файлов)
+    formatting_requirements = Column(Text)
+    structure = Column(Text)
+    special_requirements = Column(Text)
+    extracted_from_files = Column(Boolean, default=False)
+
     # Мета
     customer_username = Column(String(100))
     error_message = Column(Text)

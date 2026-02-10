@@ -128,8 +128,9 @@ async def scan_orders_job() -> None:
     from src.scraper.browser import browser_manager
     from src.analyzer.order_scorer import score_order
     from src.analyzer.price_calculator import calculate_price
-    from src.analyzer.file_analyzer import summarize_files
-    from src.generator.router import is_supported
+    from src.analyzer.file_analyzer import extract_all_content
+    from src.analyzer.field_extractor import extract_missing_fields
+    from src.generator.router import is_supported, is_banned as is_work_type_banned
     from src.ai_client import chat_completion
     from src.scraper.antiban import check_page_for_ban, ban_remaining_seconds
 
@@ -196,6 +197,14 @@ async def scan_orders_job() -> None:
                 # Парсим детали заказа
                 detail = await _retry_async(fetch_order_detail, page, summary.url)
 
+                # Stop-gate: запрещённые типы работ
+                if is_work_type_banned(detail.work_type):
+                    await _log_action(
+                        "score",
+                        f"Заказ #{summary.order_id} — тип '{detail.work_type}' запрещён (stop-gate)",
+                    )
+                    continue
+
                 # Проверяем поддерживается ли тип работы
                 if not is_supported(detail.work_type):
                     await _log_action(
@@ -204,7 +213,61 @@ async def scan_orders_job() -> None:
                     )
                     continue
 
-                # Скоринг через AI
+                # Скачивание файлов заказа (если есть)
+                downloaded_files = []
+                files_text = ""
+                if detail.file_urls:
+                    try:
+                        downloaded_files = await _retry_async(
+                            download_files, page, detail.order_id, detail.file_urls,
+                        )
+                        if downloaded_files:
+                            await _log_action(
+                                "scan",
+                                f"Заказ #{summary.order_id} — скачано {len(downloaded_files)} файлов",
+                            )
+                    except Exception as e:
+                        logger.warning("Ошибка скачивания файлов для %s: %s", summary.order_id, e)
+
+                # Извлечение контента из файлов (текст + vision для изображений)
+                vision_cost = 0.0
+                vision_in_tokens = 0
+                vision_out_tokens = 0
+                if downloaded_files:
+                    try:
+                        content_result = await extract_all_content(downloaded_files)
+                        files_text = content_result.all_text
+                        vision_cost = content_result.total_cost_usd
+                        vision_in_tokens = content_result.total_input_tokens
+                        vision_out_tokens = content_result.total_output_tokens
+                        if content_result.vision_texts:
+                            await _log_action(
+                                "scan",
+                                f"Заказ #{summary.order_id} — распознано {len(content_result.vision_texts)} изображений",
+                            )
+                    except Exception as e:
+                        logger.warning("Ошибка извлечения контента для %s: %s", summary.order_id, e)
+
+                # Извлечение недостающих полей из описания и файлов
+                extraction_cost = 0.0
+                extraction_in_tokens = 0
+                extraction_out_tokens = 0
+                try:
+                    extraction_result = await extract_missing_fields(detail, files_text)
+                    detail = extraction_result.order
+                    extraction_cost = extraction_result.cost_usd
+                    extraction_in_tokens = extraction_result.input_tokens
+                    extraction_out_tokens = extraction_result.output_tokens
+                    if extraction_result.fields_extracted:
+                        await _log_action(
+                            "scan",
+                            f"Заказ #{summary.order_id} — извлечены поля: "
+                            f"{', '.join(extraction_result.fields_extracted)}",
+                        )
+                except Exception as e:
+                    logger.warning("Ошибка извлечения полей для %s: %s", summary.order_id, e)
+
+                # Скоринг через AI (с полными данными)
                 score_result = await _retry_async(score_order, detail)
                 await _log_action(
                     "score",
@@ -228,10 +291,14 @@ async def scan_orders_job() -> None:
                         required_uniqueness=detail.required_uniqueness,
                         antiplagiat_system=detail.antiplagiat_system,
                         deadline=None,  # Строка deadline требует доп. парсинга
-                        budget_rub=detail.budget,
+                        budget_rub=detail.budget_rub,
                         score=score_result.score,
                         status="scored",
-                        customer_username=detail.customer_info[:100] if detail.customer_info else None,
+                        customer_username=detail.customer_name[:100] if detail.customer_name else None,
+                        formatting_requirements=detail.formatting_requirements or None,
+                        structure=detail.structure or None,
+                        special_requirements=detail.special_requirements or None,
+                        extracted_from_files=detail.extracted_from_files,
                     )
 
                     # Трекинг API usage для скоринга
@@ -244,6 +311,30 @@ async def scan_orders_job() -> None:
                         cost_usd=score_result.cost_usd,
                         order_id=db_order.id,
                     )
+
+                    # Трекинг API usage для vision (если были вызовы)
+                    if vision_in_tokens > 0 or vision_out_tokens > 0:
+                        await track_api_usage(
+                            session,
+                            model=settings.openai_model_main,
+                            purpose="vision",
+                            input_tokens=vision_in_tokens,
+                            output_tokens=vision_out_tokens,
+                            cost_usd=vision_cost,
+                            order_id=db_order.id,
+                        )
+
+                    # Трекинг API usage для field extraction (если были вызовы)
+                    if extraction_in_tokens > 0 or extraction_out_tokens > 0:
+                        await track_api_usage(
+                            session,
+                            model=settings.openai_model_fast,
+                            purpose="extraction",
+                            input_tokens=extraction_in_tokens,
+                            output_tokens=extraction_out_tokens,
+                            cost_usd=extraction_cost,
+                            order_id=db_order.id,
+                        )
 
                 # Решение о ставке
                 if not score_result.can_do or score_result.score < 60:
@@ -337,6 +428,41 @@ async def scan_orders_job() -> None:
                             },
                             order_id=db_order.id,
                         )
+
+                    # Уточняющее сообщение в чат после ставки
+                    try:
+                        from src.chat_ai.responder import generate_clarifying_message
+                        from src.scraper.chat import send_message as chat_send_message
+
+                        await browser_manager.random_delay(min_sec=3, max_sec=8)
+                        clarify_msg = await generate_clarifying_message(
+                            work_type=detail.work_type,
+                            subject=detail.subject,
+                            title=detail.title,
+                            description=detail.description,
+                            required_uniqueness=detail.required_uniqueness,
+                            antiplagiat_system=detail.antiplagiat_system,
+                            bid_price=bid_price,
+                        )
+                        if clarify_msg:
+                            send_ok = await chat_send_message(page, summary.order_id, clarify_msg.text)
+                            if send_ok:
+                                async with async_session() as session:
+                                    await create_message(
+                                        session,
+                                        order_id=db_order.id,
+                                        direction="outgoing",
+                                        text=clarify_msg.text,
+                                        is_auto_reply=True,
+                                    )
+                                await _log_action(
+                                    "chat",
+                                    f"Уточняющее сообщение отправлено: \"{clarify_msg.text[:100]}\"",
+                                    order_id=db_order.id,
+                                )
+                    except Exception as e:
+                        logger.warning("Ошибка отправки уточняющего сообщения: %s", e)
+
                 else:
                     await _log_action(
                         "bid",
@@ -606,7 +732,8 @@ async def chat_responder_job() -> None:
     from src.scraper.auth import login
     from src.scraper.chat import get_active_chats, get_messages, send_message
     from src.scraper.browser import browser_manager
-    from src.chat_ai.responder import generate_response
+    from src.chat_ai.responder import generate_response, parse_customer_answer
+    from src.database.crud import update_order_fields
 
     await _track_task()
     try:
@@ -646,13 +773,43 @@ async def chat_responder_job() -> None:
                         text=last_msg.text,
                     )
 
+                # Парсинг ответа заказчика: обновляем поля если чего-то не хватает
+                if not order.antiplagiat_system or not order.required_uniqueness:
+                    try:
+                        context_str = (
+                            f"Тип: {order.work_type}, Предмет: {order.subject}, "
+                            f"Тема: {order.title}"
+                        )
+                        parsed = await parse_customer_answer(
+                            customer_text=last_msg.text,
+                            order_context=context_str,
+                        )
+                        update_kwargs = {}
+                        if parsed.get("antiplagiat_system") and not order.antiplagiat_system:
+                            update_kwargs["antiplagiat_system"] = parsed["antiplagiat_system"]
+                        if parsed.get("required_uniqueness") and not order.required_uniqueness:
+                            update_kwargs["required_uniqueness"] = int(parsed["required_uniqueness"])
+                        if update_kwargs:
+                            async with async_session() as session:
+                                await update_order_fields(session, order.id, **update_kwargs)
+                            # Перечитаем заказ с обновлёнными полями
+                            async with async_session() as session:
+                                order = await get_order_by_avtor24_id(session, avtor24_id)
+                            await _log_action(
+                                "chat",
+                                f"Обновлены поля из ответа заказчика: {update_kwargs}",
+                                order_id=order.id,
+                            )
+                    except Exception as e:
+                        logger.warning("Ошибка парсинга ответа заказчика: %s", e)
+
                 # Формируем историю для AI
                 message_history = []
                 for msg in chat_messages[:-1]:  # Все кроме последнего
                     role = "user" if msg.is_incoming else "assistant"
                     message_history.append({"role": role, "content": msg.text})
 
-                # Генерируем ответ
+                # Генерируем ответ с ПОЛНЫМ контекстом
                 ai_response = await generate_response(
                     order_description=order.description or order.title,
                     message_history=message_history,
@@ -663,6 +820,14 @@ async def chat_responder_job() -> None:
                     deadline=str(order.deadline) if order.deadline else "",
                     required_uniqueness=order.required_uniqueness,
                     antiplagiat_system=order.antiplagiat_system or "",
+                    bid_price=order.bid_price,
+                    pages_min=order.pages_min,
+                    pages_max=order.pages_max,
+                    font_size=order.font_size or 14,
+                    line_spacing=order.line_spacing or 1.5,
+                    formatting_requirements=order.formatting_requirements or "",
+                    structure=order.structure or "",
+                    special_requirements=order.special_requirements or "",
                 )
 
                 # Отправляем ответ

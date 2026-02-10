@@ -56,10 +56,18 @@ async def dashboard_stats(user: str = Depends(get_current_user)):
     async with async_session() as session:
         stats = await get_dashboard_stats(session)
 
-    from src.main import bot_running, start_time
-    stats["bot_running"] = bot_running
-    stats["uptime"] = int(time.time() - start_time)
+    import src.main as main_module
+    stats["bot_running"] = main_module.bot_running
+    stats["uptime"] = int(time.time() - main_module.start_time)
     return stats
+
+
+@router.post("/api/dashboard/bot/toggle")
+async def toggle_bot(user: str = Depends(get_current_user)):
+    """Включить/выключить бота."""
+    import src.main as main_module
+    main_module.bot_running = not main_module.bot_running
+    return {"ok": True, "bot_running": main_module.bot_running}
 
 
 # ---------------------------------------------------------------------------

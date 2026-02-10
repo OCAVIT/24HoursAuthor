@@ -1,3 +1,6 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live_api: tests that call real external APIs (text.ru, etc.) — slow, costs credits",
+]

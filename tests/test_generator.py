@@ -529,6 +529,25 @@ class TestRouter:
         assert not is_supported("Помощь on-line")
         assert not is_supported("Подбор темы работы")
 
+    def test_is_banned_with_config(self):
+        """is_banned возвращает True для типов из BANNED_WORK_TYPES."""
+        from src.generator.router import is_banned
+        with patch("src.config.settings") as mock_settings:
+            mock_settings.banned_work_types_list = ["Чертёж", "Онлайн-консультация", "Монография"]
+            assert is_banned("Чертёж") is True
+            assert is_banned("Онлайн-консультация") is True
+            assert is_banned("Монография") is True
+            assert is_banned("Эссе") is False
+            assert is_banned("Курсовая работа") is False
+
+    def test_is_banned_empty_config(self):
+        """is_banned возвращает False когда BANNED_WORK_TYPES пуст."""
+        from src.generator.router import is_banned
+        with patch("src.config.settings") as mock_settings:
+            mock_settings.banned_work_types_list = []
+            assert is_banned("Чертёж") is False
+            assert is_banned("Эссе") is False
+
 
 # ===== Тесты проверки минимального объёма (volume compliance) =====
 

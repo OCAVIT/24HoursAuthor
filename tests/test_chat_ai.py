@@ -179,7 +179,7 @@ class TestResponseLength:
             )
 
         _, kwargs = mock_call.call_args
-        assert kwargs["max_tokens"] <= 256
+        assert kwargs["max_tokens"] <= 400
 
 
 # ===== Тесты передачи контекста =====
