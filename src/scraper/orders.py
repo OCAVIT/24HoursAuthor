@@ -158,20 +158,80 @@ async def parse_order_cards(page: Page) -> list[OrderSummary]:
     return orders
 
 
-async def fetch_order_list(page: Page, max_pages: int = 3) -> list[OrderSummary]:
-    """Получить список заказов с нескольких страниц."""
+async def _detect_total_pages(page: Page) -> int:
+    """Определить количество страниц из пагинации.
+
+    Пагинация: styled__PaginationStyled-sc-*
+    Кнопки:    styled__Item-sc-* с числами (1, 2, 3, ..., N)
+    Формат:    ← Сюда | 1 | 2 | 3 | ... | 10 | Туда →
+    """
+    try:
+        numbers = await page.evaluate("""
+            () => {
+                let container = document.querySelector('[class*="PaginationStyled"]');
+                if (!container) return [];
+                let items = container.querySelectorAll('[class*="Item-sc"]');
+                let nums = [];
+                for (let item of items) {
+                    let text = item.textContent.trim();
+                    let n = parseInt(text);
+                    if (!isNaN(n)) nums.push(n);
+                }
+                return nums;
+            }
+        """)
+        if numbers:
+            total = max(numbers)
+            logger.info("Пагинация: обнаружено %d страниц (кнопки: %s)", total, numbers)
+            return total
+    except Exception as e:
+        logger.warning("Не удалось определить кол-во страниц: %s", e)
+    return 1
+
+
+async def fetch_order_list(page: Page, max_pages: int = 10) -> list[OrderSummary]:
+    """Получить список заказов со всех доступных страниц.
+
+    Сначала загружает первую страницу, определяет общее кол-во страниц
+    из пагинации, затем парсит все страницы до min(total, max_pages).
+    """
     all_orders: list[OrderSummary] = []
 
-    for page_num in range(1, max_pages + 1):
-        url = f"{SEARCH_URL}?page={page_num}" if page_num > 1 else SEARCH_URL
+    # Загружаем первую страницу и определяем кол-во страниц
+    logger.info("Парсинг страницы 1: %s", SEARCH_URL)
+    try:
+        await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
+        await browser_manager.short_delay()
+        await page.wait_for_selector(".auctionOrder", timeout=15000)
+        await browser_manager.short_delay()
+    except Exception as e:
+        logger.error("Ошибка загрузки первой страницы: %s", e)
+        return all_orders
+
+    orders = await parse_order_cards(page)
+    if not orders:
+        logger.info("Первая страница пуста")
+        return all_orders
+
+    all_orders.extend(orders)
+    logger.info("Страница 1: %d заказов", len(orders))
+
+    # Определяем кол-во страниц из пагинации
+    total_pages = await _detect_total_pages(page)
+    pages_to_parse = min(total_pages, max_pages)
+    logger.info("Будет распарсено %d страниц (доступно %d, лимит %d)",
+                pages_to_parse, total_pages, max_pages)
+
+    # Парсим остальные страницы
+    for page_num in range(2, pages_to_parse + 1):
+        url = f"{SEARCH_URL}?page={page_num}"
         logger.info("Парсинг страницы %d: %s", page_num, url)
 
         try:
+            await browser_manager.random_delay(min_sec=2, max_sec=5)
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            # React SPA — ждём рендеринга
             await browser_manager.short_delay()
             await page.wait_for_selector(".auctionOrder", timeout=15000)
-            # Дополнительная задержка для полного рендера
             await browser_manager.short_delay()
 
             orders = await parse_order_cards(page)
@@ -182,12 +242,9 @@ async def fetch_order_list(page: Page, max_pages: int = 3) -> list[OrderSummary]
             all_orders.extend(orders)
             logger.info("Страница %d: %d заказов", page_num, len(orders))
 
-            if page_num < max_pages:
-                await browser_manager.random_delay(min_sec=2, max_sec=5)
-
         except Exception as e:
             logger.error("Ошибка парсинга страницы %d: %s", page_num, e)
             break
 
-    logger.info("Итого найдено %d заказов", len(all_orders))
+    logger.info("Итого найдено %d заказов с %d страниц", len(all_orders), pages_to_parse)
     return all_orders

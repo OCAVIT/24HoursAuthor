@@ -48,6 +48,7 @@ class BrowserManager:
         self._page: Optional[Page] = None
         self._user_agent: str = random.choice(USER_AGENTS)
         self._viewport: dict = random.choice(VIEWPORTS)
+        self._page_lock: asyncio.Lock = asyncio.Lock()
 
     async def start(self) -> Page:
         """Запуск браузера и создание страницы."""
@@ -162,6 +163,11 @@ class BrowserManager:
     def page(self) -> Optional[Page]:
         """Текущая страница."""
         return self._page
+
+    @property
+    def page_lock(self) -> asyncio.Lock:
+        """Блокировка страницы — захватить перед навигацией/evaluate."""
+        return self._page_lock
 
     @property
     def context(self) -> Optional[BrowserContext]:

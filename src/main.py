@@ -51,6 +51,10 @@ bot_running = True
 # Флаг для graceful shutdown — текущие задачи завершаются, новые не запускаются
 _shutting_down = False
 
+# In-memory кеш уже обработанных order_id — пропускаем без обращения к БД.
+# Сбрасывается при перезапуске; БД-дедупликация остаётся как fallback.
+_seen_order_ids: set[str] = set()
+
 # Счётчик активных задач (для ожидания завершения при shutdown)
 _active_tasks = 0
 _active_tasks_lock = asyncio.Lock()
@@ -136,8 +140,11 @@ async def scan_orders_job() -> None:
     from src.scraper.antiban import check_page_for_ban, ban_remaining_seconds
 
     await _track_task()
+    _page_locked = False
     try:
         page = await _retry_async(login)
+        await browser_manager.page_lock.acquire()
+        _page_locked = True
 
         # Проверяем страницу на бан после логина
         if await check_page_for_ban(page):
@@ -186,10 +193,15 @@ async def scan_orders_job() -> None:
                 break
 
             try:
-                # Дедупликация по БД
+                # Быстрая in-memory дедупликация (без обращения к БД)
+                if summary.order_id in _seen_order_ids:
+                    continue
+
+                # Дедупликация по БД (fallback после перезапуска)
                 async with async_session() as session:
                     existing = await get_order_by_avtor24_id(session, summary.order_id)
                 if existing:
+                    _seen_order_ids.add(summary.order_id)
                     continue
 
                 # Случайная задержка для антибана
@@ -200,6 +212,16 @@ async def scan_orders_job() -> None:
 
                 # Stop-gate: запрещённые типы работ
                 if is_work_type_banned(detail.work_type):
+                    _seen_order_ids.add(summary.order_id)
+                    # Сохраняем в БД чтобы не тратить ресурсы после перезапуска
+                    async with async_session() as session:
+                        await create_order(
+                            session,
+                            avtor24_id=summary.order_id,
+                            title=detail.title or summary.title,
+                            work_type=detail.work_type,
+                            status="skipped",
+                        )
                     await _log_action(
                         "score",
                         f"Заказ #{summary.order_id} — тип '{detail.work_type}' запрещён (stop-gate)",
@@ -208,6 +230,15 @@ async def scan_orders_job() -> None:
 
                 # Проверяем поддерживается ли тип работы
                 if not is_supported(detail.work_type):
+                    _seen_order_ids.add(summary.order_id)
+                    async with async_session() as session:
+                        await create_order(
+                            session,
+                            avtor24_id=summary.order_id,
+                            title=detail.title or summary.title,
+                            work_type=detail.work_type,
+                            status="skipped",
+                        )
                     await _log_action(
                         "score",
                         f"Заказ #{summary.order_id} — тип '{detail.work_type}' не поддерживается",
@@ -337,6 +368,9 @@ async def scan_orders_job() -> None:
                             order_id=db_order.id,
                         )
 
+                # Заказ проанализирован и сохранён — запоминаем
+                _seen_order_ids.add(summary.order_id)
+
                 # Решение о ставке
                 if not score_result.can_do or score_result.score < 60:
                     async with async_session() as session:
@@ -442,6 +476,9 @@ async def scan_orders_job() -> None:
                     )
 
             except Exception as e:
+                # Запоминаем даже при ошибке — AI-токены уже потрачены,
+                # повторный анализ их не вернёт.
+                _seen_order_ids.add(summary.order_id)
                 logger.error("Ошибка обработки заказа %s: %s", summary.order_id, e)
                 await _log_action("error", f"Ошибка обработки заказа #{summary.order_id}: {e}")
 
@@ -459,6 +496,8 @@ async def scan_orders_job() -> None:
         except Exception:
             pass
     finally:
+        if _page_locked:
+            browser_manager.page_lock.release()
         await _untrack_task()
 
 
@@ -599,9 +638,10 @@ async def process_accepted_orders_job() -> None:
                     "Если потребуются правки — пишите, исправлю."
                 )
 
-                send_ok = await _retry_async(
-                    send_file_with_message, page, order.avtor24_id, str(docx_path), delivery_message,
-                )
+                async with browser_manager.page_lock:
+                    send_ok = await _retry_async(
+                        send_file_with_message, page, order.avtor24_id, str(docx_path), delivery_message,
+                    )
 
                 if send_ok:
                     async with async_session() as session:
@@ -710,8 +750,11 @@ async def chat_responder_job() -> None:
     from src.database.crud import update_order_fields
 
     await _track_task()
+    _page_locked = False
     try:
         page = await _retry_async(login)
+        await browser_manager.page_lock.acquire()
+        _page_locked = True
 
         active_chats = await _retry_async(get_active_chats, page)
         if not active_chats:
@@ -895,6 +938,8 @@ async def chat_responder_job() -> None:
         logger.error("Критическая ошибка в chat_responder_job: %s", e)
         await _log_action("error", f"Критическая ошибка чат-респондера: {e}")
     finally:
+        if _page_locked:
+            browser_manager.page_lock.release()
         await _untrack_task()
 
 
@@ -953,8 +998,11 @@ async def check_accepted_bids_job() -> None:
     from src.scraper.browser import browser_manager
 
     await _track_task()
+    _page_locked = False
     try:
         page = await _retry_async(login)
+        await browser_manager.page_lock.acquire()
+        _page_locked = True
 
         # Переходим на главную — там раздел "Ждут подтверждения"
         home_url = f"{settings.avtor24_base_url}/home"
@@ -1088,6 +1136,8 @@ async def check_accepted_bids_job() -> None:
         logger.error("Ошибка проверки принятых заказов: %s", e)
         await _log_action("error", f"Ошибка проверки принятых ставок: {e}")
     finally:
+        if _page_locked:
+            browser_manager.page_lock.release()
         await _untrack_task()
 
 

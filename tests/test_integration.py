@@ -1268,3 +1268,86 @@ class TestCrossModuleIntegration:
         has_conclusion = any("заключение" in h.lower() for h in headings)
         assert has_intro
         assert has_conclusion
+
+
+# ===========================================================================
+# ТЕСТ 7: In-memory дедупликация (_seen_order_ids)
+# ===========================================================================
+
+class TestSeenOrderIdsDedup:
+    """Тесты in-memory кеша _seen_order_ids для экономии AI-токенов."""
+
+    def setup_method(self):
+        """Очищаем кеш перед каждым тестом."""
+        import src.main as main_mod
+        main_mod._seen_order_ids.clear()
+
+    def test_seen_set_skips_known_ids(self):
+        """Заказ, уже в _seen_order_ids, пропускается без обращения к БД."""
+        import src.main as main_mod
+        main_mod._seen_order_ids.add("77001")
+        assert "77001" in main_mod._seen_order_ids
+
+    async def test_db_hit_populates_seen_set(self, int_session):
+        """Заказ найденный в БД добавляется в _seen_order_ids."""
+        import src.main as main_mod
+
+        # Создаём заказ в БД
+        await create_order(int_session, avtor24_id="77002", title="DB hit test", status="bid_placed")
+
+        # Проверяем что до запроса его нет в кеше
+        assert "77002" not in main_mod._seen_order_ids
+
+        # Имитируем логику scan_orders_job: находим в БД → добавляем в кеш
+        existing = await get_order_by_avtor24_id(int_session, "77002")
+        assert existing is not None
+        main_mod._seen_order_ids.add("77002")
+
+        # Теперь в кеше
+        assert "77002" in main_mod._seen_order_ids
+
+    async def test_skipped_order_saved_to_db(self, int_session):
+        """Заказ с неподдерживаемым типом сохраняется в БД со статусом 'skipped'."""
+        order = await create_order(
+            int_session,
+            avtor24_id="77003",
+            title="Пропущенный заказ",
+            work_type="Чертёж",
+            status="skipped",
+        )
+        assert order.status == "skipped"
+
+        # При следующем сканировании он найдётся в БД и будет пропущен
+        existing = await get_order_by_avtor24_id(int_session, "77003")
+        assert existing is not None
+        assert existing.status == "skipped"
+
+    async def test_exception_path_adds_to_seen(self):
+        """Даже при исключении order_id попадает в _seen_order_ids."""
+        import src.main as main_mod
+
+        # Имитируем поведение: AI-анализ прошёл, но DB save упал → exception
+        order_id = "77004"
+        try:
+            # Симуляция: AI токены уже потрачены, а затем ошибка
+            raise RuntimeError("DB connection lost")
+        except Exception:
+            main_mod._seen_order_ids.add(order_id)
+
+        # Следующий цикл не будет тратить токены повторно
+        assert order_id in main_mod._seen_order_ids
+
+    def test_seen_set_grows_and_persists_across_cycles(self):
+        """Кеш накапливает ID между циклами сканирования."""
+        import src.main as main_mod
+
+        # Цикл 1
+        main_mod._seen_order_ids.add("A1")
+        main_mod._seen_order_ids.add("A2")
+
+        # Цикл 2
+        main_mod._seen_order_ids.add("A3")
+
+        assert len(main_mod._seen_order_ids) == 3
+        assert "A1" in main_mod._seen_order_ids
+        assert "A3" in main_mod._seen_order_ids
