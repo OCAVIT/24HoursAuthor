@@ -214,14 +214,6 @@ async def scan_orders_job() -> None:
                     )
                     continue
 
-                # Пропускаем заказы с договорной ценой (нет фиксированного бюджета)
-                if not detail.budget_rub:
-                    await _log_action(
-                        "score",
-                        f"Заказ #{summary.order_id} — договорная цена, пропускаем",
-                    )
-                    continue
-
                 # Скачивание файлов заказа (если есть)
                 downloaded_files = []
                 files_text = ""

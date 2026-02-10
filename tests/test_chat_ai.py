@@ -118,18 +118,20 @@ class TestNoAIMention:
                 new_message="Как вы будете делать?",
             )
 
+        import re
         lower = result.text.lower()
-        for word in BANNED_WORDS:
-            assert word not in lower, f"Ответ содержит запрещённое слово: '{word}'"
+        for pattern in BANNED_WORDS:
+            assert not re.search(pattern, lower), f"Ответ содержит запрещённое слово: '{pattern}'"
 
     @pytest.mark.asyncio
     async def test_banned_words_list_complete(self):
         """Список запрещённых слов содержит все ключевые варианты."""
-        assert "ai" in BANNED_WORDS
-        assert "нейросеть" in BANNED_WORDS
-        assert "chatgpt" in BANNED_WORDS
-        assert "gpt" in BANNED_WORDS
-        assert "искусственный интеллект" in BANNED_WORDS
+        joined = " ".join(BANNED_WORDS)
+        assert "ai" in joined
+        assert "нейросеть" in joined
+        assert "chatgpt" in joined
+        assert "gpt" in joined
+        assert "искусственный интеллект" in joined
 
 
 # ===== Тесты длины ответа =====

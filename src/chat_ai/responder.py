@@ -14,12 +14,12 @@ logger = logging.getLogger(__name__)
 PROMPTS_DIR = Path(__file__).parent / "prompts"
 SYSTEM_PROMPT = (PROMPTS_DIR / "chat_system.txt").read_text(encoding="utf-8")
 
-# Слова, которые не должны появляться в ответе
+# Слова, которые не должны появляться в ответе (проверяются как целые слова через regex)
 BANNED_WORDS = [
-    "ai", "нейросеть", "нейросети", "нейросетью", "нейросетей",
-    "chatgpt", "gpt", "искусственный интеллект", "искусственного интеллекта",
-    "ии", "openai", "бот", "автоматически сгенерирован",
-    "языковая модель", "языковой модели",
+    r"\bai\b", r"\bнейросеть\b", r"\bнейросети\b", r"\bнейросетью\b", r"\bнейросетей\b",
+    r"\bchatgpt\b", r"\bgpt\b", r"\bискусственный интеллект", r"\bискусственного интеллекта\b",
+    r"\bии\b", r"\bopenai\b", r"\bбот\b", r"\bботом\b", r"\bавтоматически сгенерирован",
+    r"\bязыковая модель", r"\bязыковой модели",
 ]
 
 
@@ -445,9 +445,10 @@ def _build_context(
 
 
 def _sanitize_response(text: str) -> str:
-    """Проверить ответ на запрещённые слова и убрать их."""
+    """Проверить ответ на запрещённые слова (целые слова через regex)."""
+    import re
     lower = text.lower()
-    for word in BANNED_WORDS:
-        if word in lower:
-            logger.warning("Обнаружено запрещённое слово в ответе: '%s'", word)
+    for pattern in BANNED_WORDS:
+        if re.search(pattern, lower):
+            logger.warning("Обнаружено запрещённое слово в ответе: '%s'", pattern)
     return text

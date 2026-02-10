@@ -1229,9 +1229,10 @@ class TestCrossModuleIntegration:
         """Чат-респондер содержит список запрещённых слов."""
         from src.chat_ai.responder import BANNED_WORDS
 
+        joined = " ".join(BANNED_WORDS)
         required_banned = ["ai", "chatgpt", "gpt", "нейросеть", "искусственный интеллект"]
         for word in required_banned:
-            assert word in BANNED_WORDS, f"'{word}' должно быть в списке запрещённых"
+            assert word in joined, f"'{word}' должно быть в списке запрещённых"
 
     async def test_docx_builder_sections_parsing(self):
         """DOCX builder корректно разбивает текст на секции."""
