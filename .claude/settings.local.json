@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"e:\\\\VibeProjects\\\\Autor24\" log --oneline -1)",
+      "Bash(git -C \"e:\\\\VibeProjects\\\\Autor24\" status -sb)",
+      "Bash(timeout:*)",
+      "Bash(npx @railway/cli logs:*)"
+    ]
+  }
+}

@@ -286,9 +286,9 @@ function dashboard() {
                 }]);
 
                 /* API by model pie */
-                const apiModels = data.api_by_model || {};
-                const modelLabels = Object.keys(apiModels);
-                const modelCosts = modelLabels.map(m => apiModels[m].cost_usd || 0);
+                const apiModels = data.api_by_model || [];
+                const modelLabels = apiModels.map(m => m.model);
+                const modelCosts = apiModels.map(m => m.cost_usd || 0);
                 const colors = ['#7c3aed', '#4ade80', '#facc15', '#f87171', '#60a5fa'];
                 this.renderChart('analyticsApiChart', '_analyticsApiChart', 'doughnut', modelLabels, [{
                     data: modelCosts,

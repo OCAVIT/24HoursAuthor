@@ -421,12 +421,12 @@
                                 </tr>
                             </thead>
                             <tbody>
-                                <template x-for="(info, model) in (analyticsData.api_by_model || {})" :key="model">
+                                <template x-for="item in (analyticsData.api_by_model || [])" :key="item.model">
                                     <tr class="border-b border-gray-800/30">
-                                        <td class="td-cell text-left font-mono text-accent-400" x-text="model"></td>
-                                        <td class="td-cell" x-text="fmt(info.input_tokens || 0)"></td>
-                                        <td class="td-cell" x-text="fmt(info.output_tokens || 0)"></td>
-                                        <td class="td-cell text-yellow-400" x-text="'$' + (info.cost_usd || 0).toFixed(4)"></td>
+                                        <td class="td-cell text-left font-mono text-accent-400" x-text="item.model"></td>
+                                        <td class="td-cell" x-text="fmt(item.input_tokens || 0)"></td>
+                                        <td class="td-cell" x-text="fmt(item.output_tokens || 0)"></td>
+                                        <td class="td-cell text-yellow-400" x-text="'$' + (item.cost_usd || 0).toFixed(4)"></td>
                                     </tr>
                                 </template>
                             </tbody>
