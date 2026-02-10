@@ -863,6 +863,30 @@ async def stepwise_generate(
     )
     _accumulate(sw, tokens_info)
 
+    # Шаг 4: Повторная валидация библиографии после расширения
+    # expand_to_target добавляет текст с новыми цитатами — нужно проверить их
+    bib_idx = next(
+        (i for i, s in enumerate(sw.sections)
+         if _is_bibliography(SectionPlan(name=s.name, target_words=0))),
+        None,
+    )
+    if bib_idx is not None:
+        post_expand_refs = _extract_cited_references(sw.sections)
+        if post_expand_refs:
+            logger.info(
+                "Пост-расширение: %d цитируемых авторов, проверяем библиографию",
+                len(post_expand_refs),
+            )
+            updated_bib, extra_tokens = await _validate_bibliography(
+                bib_section=sw.sections[bib_idx],
+                cited_authors=post_expand_refs,
+                title=title,
+                subject=subject,
+                system_prompt=system_prompt,
+            )
+            sw.sections[bib_idx] = updated_bib
+            _accumulate(sw, extra_tokens)
+
     # Собираем финальный текст
     sw.text = assemble_text(sw.sections, uppercase_names=uppercase_headings)
 
