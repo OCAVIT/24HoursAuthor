@@ -1350,6 +1350,21 @@ async def chat_responder_job() -> None:
                     )
                     continue
 
+                # === Дедупликация: проверяем, отвечали ли мы уже на это сообщение ===
+                # Если последнее входящее сообщение в БД совпадает с last_msg.text,
+                # значит мы уже сохранили его и отправили ответ — пропускаем.
+                async with async_session() as session:
+                    db_messages = await get_messages_for_order(session, order.id)
+                last_incoming_in_db = [m for m in db_messages if m.direction == "incoming"]
+                if last_incoming_in_db:
+                    last_incoming_text = last_incoming_in_db[-1].text
+                    if last_incoming_text.strip() == last_msg.text.strip():
+                        logger.debug(
+                            "Чат %s: последнее входящее сообщение уже обработано, пропускаем",
+                            avtor24_id,
+                        )
+                        continue
+
                 # Сохраняем входящее сообщение
                 async with async_session() as session:
                     await create_message(

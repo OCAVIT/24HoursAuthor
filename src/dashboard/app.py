@@ -218,11 +218,36 @@ async def regen_order(order_id: int, user: str = Depends(get_current_user)):
         order = await get_order(session, order_id)
         if not order:
             raise HTTPException(status_code=404, detail="Заказ не найден")
+
+        prev_status = order.status
         await update_order_status(
             session, order_id, "accepted",
             generated_file_path=None, error_message=None,
         )
-    return {"ok": True, "order_id": order_id, "new_status": "accepted"}
+
+        # Логирование перегенерации
+        from src.database.crud import create_action_log
+        await create_action_log(
+            session,
+            action="generate",
+            details=f"Перегенерация запущена вручную через дашборд (было '{prev_status}' → 'accepted')",
+            order_id=order_id,
+        )
+
+    # WebSocket broadcast в логи
+    try:
+        from src.notifications.websocket import log_manager
+        from datetime import datetime
+        await log_manager.broadcast({
+            "action": "generate",
+            "details": f"Перегенерация заказа #{order.avtor24_id} запущена вручную",
+            "order_id": order_id,
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception:
+        pass
+
+    return {"ok": True, "order_id": order_id, "new_status": "accepted", "message": "Перегенерация запущена"}
 
 
 # ---------------------------------------------------------------------------
