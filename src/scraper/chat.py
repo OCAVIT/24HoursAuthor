@@ -308,155 +308,76 @@ async def _navigate_home(page: Page) -> bool:
     return True
 
 
-async def _extract_order_ids_from_section(page: Page, section_keywords: list[str]) -> list[str]:
-    """Извлечь order_id из определённой секции на /home (без тегов статусов).
+async def _click_home_tab(page: Page, tab_text: str) -> bool:
+    """Кликнуть на вкладку на /home (Активные чаты / В работе / Ждут подтверждения / В аукционе).
 
-    Обёртка над _extract_orders_with_tags, возвращает только id.
+    Вкладки реализованы как <span class="header-filter-item"> внутри <li>.
+    Клик по родительскому <li> переключает вид.
     """
-    items = await _extract_orders_with_tags(page, section_keywords)
-    return [oid for oid, _tag in items]
+    clicked = await page.evaluate("""
+        (tabText) => {
+            const spans = document.querySelectorAll('.header-filter-item, span');
+            for (const span of spans) {
+                const text = (span.textContent || '').trim();
+                if (text === tabText || text.includes(tabText)) {
+                    const target = span.closest('li') || span;
+                    target.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+    """, tab_text)
+    if clicked:
+        await asyncio.sleep(3)  # ждём обновления React-контента
+    else:
+        logger.warning("Вкладка '%s' не найдена на /home", tab_text)
+    return clicked
 
 
-async def _extract_orders_with_tags(
-    page: Page, section_keywords: list[str],
-) -> list[tuple[str, str]]:
-    """Извлечь order_id + тег статуса из секции на /home.
+async def _extract_visible_order_ids(page: Page) -> list[str]:
+    """Извлечь order_id из текущего вида на /home (document.body).
 
-    Args:
-        page: Playwright page (уже на /home).
-        section_keywords: список ключевых слов для поиска заголовка секции.
-
-    Returns:
-        Список кортежей (order_id, status_tag).
-        status_tag — текст тега рядом с чатом, например "завершен", "Ждёт подтверждения", "" (пусто).
+    ВАЖНО: Контент рендерится ВНЕ #root — ищем по document.body.
+    Исключаем рекомендованные заказы (with ?from_recommended= в URL).
     """
-    raw: list[dict] = await page.evaluate("""
-        (keywords) => {
-            const root = document.querySelector('#root');
-            if (!root) return [];
-
+    raw: list[str] = await page.evaluate(r"""
+        () => {
             const results = [];
             const seen = new Set();
-
-            // Ищем секцию по заголовку
-            let section = null;
-            const candidates = root.querySelectorAll(
-                'h2, h3, h4, [class*="Title"], [class*="Header"], [class*="Tab"], div, span'
-            );
-            for (const el of candidates) {
-                const text = (el.textContent || '').trim();
-                const matches = keywords.some(kw => text.includes(kw));
-                if (matches) {
-                    section = el.closest(
-                        'section, [class*="Section"], [class*="Block"], [class*="Container"], [class*="List"]'
-                    ) || el.parentElement;
-                    break;
-                }
-            }
-
-            const container = section || root;
-
-            // Для каждой ссылки на заказ находим ближайший элемент-карточку
-            // и извлекаем из неё тег статуса (badge / label)
-            container.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
-                const match = a.href.match(/getoneorder\\/(\\d+)/);
+            document.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
+                if (a.href.includes('from_recommended')) return;
+                const match = a.href.match(/getoneorder\/(\d+)/);
                 if (!match || seen.has(match[1])) return;
                 seen.add(match[1]);
-
-                // Ищем карточку-контейнер чата (ближайший родитель)
-                const card = a.closest(
-                    '[class*="Card"], [class*="Item"], [class*="Chat"], [class*="Order"], li, article'
-                ) || a.parentElement;
-
-                // Ищем тег статуса внутри карточки
-                let tag = '';
-                if (card) {
-                    // Ищем badge/label элементы
-                    const badgeEls = card.querySelectorAll(
-                        '[class*="Badge"], [class*="Status"], [class*="Tag"], [class*="Label"], ' +
-                        '[class*="badge"], [class*="status"], [class*="tag"], [class*="label"]'
-                    );
-                    for (const badge of badgeEls) {
-                        const badgeText = (badge.textContent || '').trim();
-                        if (badgeText) {
-                            tag = badgeText;
-                            break;
-                        }
-                    }
-                    // Fallback: ищем мелкий текст с ключевыми словами статуса
-                    if (!tag) {
-                        const spans = card.querySelectorAll('span, small, div');
-                        for (const s of spans) {
-                            const t = (s.textContent || '').trim().toLowerCase();
-                            if (t.includes('завершен') || t.includes('завершён') ||
-                                t.includes('ждёт подтверждения') || t.includes('ждет подтверждения') ||
-                                t.includes('отменен') || t.includes('отменён')) {
-                                tag = (s.textContent || '').trim();
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                results.push({ id: match[1], tag: tag });
+                results.push(match[1]);
             });
-
-            // Fallback — если секцию не нашли
-            if (!section) {
-                root.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
-                    const match = a.href.match(/getoneorder\\/(\\d+)/);
-                    if (!match || seen.has(match[1])) return;
-                    seen.add(match[1]);
-                    results.push({ id: match[1], tag: '' });
-                });
-            }
-
             return results;
         }
-    """, section_keywords)
-
-    return [(item["id"], item.get("tag", "")) for item in raw]
-
-
-# Теги статусов, означающие "не в работе" — пропускаем
-_SKIP_TAGS = {"завершен", "завершён", "отменен", "отменён"}
-_WAITING_TAGS = {"ждёт подтверждения", "ждет подтверждения"}
+    """)
+    return raw
 
 
 async def get_accepted_order_ids(page: Page) -> list[str]:
-    """Получить order_id из раздела «Активные» (чаты) на /home.
+    """Получить order_id из вкладки «Активные чаты» на /home.
 
-    Это заказы, где заказчик уже выбрал нас автором и работа в процессе.
+    Это заказы, где заказчик уже выбрал нас автором.
     Используется для перевода bid_placed → accepted.
 
-    Фильтрация по тегам:
-    - «завершен» / «отменен» → пропускаем
-    - «ждёт подтверждения» → тоже пропускаем (ещё не приняты)
-    - Без тега или другой тег → возвращаем (в работе)
+    Вкладка «Активные чаты» — дефолтная на /home, показывает
+    все заказы где мы назначены автором (в работе / доставлены).
     """
     try:
         if not await _navigate_home(page):
             return []
 
-        items = await _extract_orders_with_tags(
-            page,
-            ["Активные", "активные", "Активные чаты", "активные чаты"],
-        )
-
-        # Фильтруем: только «в работе» (ни завершён, ни ждёт подтверждения)
-        active_ids = []
-        for oid, tag in items:
-            tag_lower = tag.lower().strip()
-            if any(skip in tag_lower for skip in _SKIP_TAGS):
-                continue
-            if any(wait in tag_lower for wait in _WAITING_TAGS):
-                continue
-            active_ids.append(oid)
+        # «Активные чаты» — дефолтная вкладка, кликать не нужно
+        active_ids = await _extract_visible_order_ids(page)
 
         if active_ids:
             logger.info(
-                "Найдено %d заказов в работе в разделе «Активные» на /home (из %d всего)",
-                len(active_ids), len(items),
+                "Найдено %d заказов в «Активные чаты» на /home",
+                len(active_ids),
             )
         return active_ids
 
@@ -466,65 +387,52 @@ async def get_accepted_order_ids(page: Page) -> list[str]:
 
 
 async def get_waiting_confirmation_order_ids(page: Page) -> list[str]:
-    """Получить order_id заказов со статусом «Ждёт подтверждения» на /home.
+    """Получить order_id заказов со статусом «Ждут подтверждения» на /home.
 
+    Кликает вкладку «Ждут подтверждения» и извлекает order_id.
     Эти заказы требуют нажатия кнопки «Подтвердить» на странице заказа.
     """
     try:
         if not await _navigate_home(page):
             return []
 
-        items = await _extract_orders_with_tags(
-            page,
-            ["Активные", "активные", "Активные чаты", "активные чаты"],
-        )
+        if not await _click_home_tab(page, "Ждут подтверждения"):
+            logger.warning("Не удалось переключить на вкладку «Ждут подтверждения»")
+            return []
 
-        waiting_ids = []
-        for oid, tag in items:
-            tag_lower = tag.lower().strip()
-            if any(wait in tag_lower for wait in _WAITING_TAGS):
-                waiting_ids.append(oid)
+        waiting_ids = await _extract_visible_order_ids(page)
 
         if waiting_ids:
             logger.info(
-                "Найдено %d заказов «Ждёт подтверждения» на /home",
+                "Найдено %d заказов «Ждут подтверждения» на /home",
                 len(waiting_ids),
             )
         return waiting_ids
 
     except Exception as e:
-        logger.error("Ошибка получения заказов «Ждёт подтверждения»: %s", e)
+        logger.error("Ошибка получения заказов «Ждут подтверждения»: %s", e)
         return []
 
 
 async def get_active_chats(page: Page) -> list[str]:
     """Получить список order_id с активными чатами (в работе).
 
-    Проверяет /home на наличие активных чатов.
-    Пропускает завершённые и ожидающие подтверждения.
+    Кликает вкладку «Активные чаты» (дефолтная) и извлекает order_id.
+    Показывает заказы где мы назначены автором и работа активна.
     """
     try:
         if not await _navigate_home(page):
             return []
 
-        items = await _extract_orders_with_tags(
-            page,
-            ["Активные", "активные", "Активные чаты", "активные чаты"],
-        )
+        # «Активные чаты» — дефолтная вкладка, но кликнем на всякий случай
+        # (если до этого переключались на другую вкладку)
+        await _click_home_tab(page, "Активные чаты")
 
-        # Фильтруем: только «в работе»
-        active_ids = []
-        for oid, tag in items:
-            tag_lower = tag.lower().strip()
-            if any(skip in tag_lower for skip in _SKIP_TAGS):
-                continue
-            if any(wait in tag_lower for wait in _WAITING_TAGS):
-                continue
-            active_ids.append(oid)
+        active_ids = await _extract_visible_order_ids(page)
 
         logger.info(
-            "Найдено %d активных чатов (в работе) из %d всего",
-            len(active_ids), len(items),
+            "Найдено %d активных чатов на /home",
+            len(active_ids),
         )
         return active_ids
 

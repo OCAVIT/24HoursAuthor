@@ -17,7 +17,7 @@ from src.scraper.chat import (
     get_messages, send_message, ChatMessage, cancel_order,
     get_accepted_order_ids, get_active_chats,
     get_waiting_confirmation_order_ids,
-    _navigate_home, _extract_order_ids_from_section,
+    _navigate_home, _click_home_tab, _extract_visible_order_ids,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -725,28 +725,41 @@ class TestChat:
 # ===== Тесты парсинга активных заказов с /home =====
 
 class TestActiveOrdersParsing:
-    """Тесты get_accepted_order_ids / get_active_chats — парсинг раздела «Активные» на /home."""
+    """Тесты get_accepted_order_ids / get_active_chats — парсинг вкладок на /home.
 
-    def _make_home_page(self, evaluate_result, url="https://avtor24.ru/home"):
+    Новая логика: используем вкладки (tabs) на /home вместо поиска секций в DOM.
+    Контент рендерится вне #root — ищем по document.body.
+    """
+
+    @staticmethod
+    def _make_home_page(order_ids: list[str], url="https://avtor24.ru/home"):
         """Создать мок страницы /home.
 
-        evaluate_result: list[dict] с полями {id, tag} — формат _extract_orders_with_tags.
+        order_ids: список order_id, возвращаемых _extract_visible_order_ids.
+        evaluate вызывается 1 раз для get_accepted (только extraction)
+        или 2 раза для get_active_chats (tab click + extraction).
         """
         page = MagicMock()
         page.url = url
         page.goto = AsyncMock()
-        page.evaluate = AsyncMock(return_value=evaluate_result)
+        # Для get_accepted: 1 evaluate (extraction → order_ids)
+        # Для get_active_chats: 2 evaluates (tab click → True, extraction → order_ids)
+        page.evaluate = AsyncMock(side_effect=[True, order_ids])
         return page
 
     @staticmethod
-    def _ids(ids: list[str], tag: str = "") -> list[dict]:
-        """Хелпер: превратить список id в формат [{id, tag}] для мока evaluate."""
-        return [{"id": oid, "tag": tag} for oid in ids]
+    def _make_accepted_page(order_ids: list[str], url="https://avtor24.ru/home"):
+        """Мок для get_accepted_order_ids (1 evaluate = extraction only)."""
+        page = MagicMock()
+        page.url = url
+        page.goto = AsyncMock()
+        page.evaluate = AsyncMock(return_value=order_ids)
+        return page
 
     @pytest.mark.asyncio
     async def test_get_accepted_order_ids_returns_ids(self):
-        """get_accepted_order_ids возвращает order_id из раздела «Активные»."""
-        page = self._make_home_page(self._ids(["12345", "67890"]))
+        """get_accepted_order_ids возвращает order_id из вкладки «Активные чаты»."""
+        page = self._make_accepted_page(["12345", "67890"])
 
         with patch("src.scraper.chat.settings") as mock_settings:
             mock_settings.avtor24_base_url = "https://avtor24.ru"
@@ -754,12 +767,11 @@ class TestActiveOrdersParsing:
 
         assert result == ["12345", "67890"]
         page.goto.assert_awaited_once()
-        page.evaluate.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_get_accepted_order_ids_empty(self):
         """get_accepted_order_ids возвращает [] если нет активных заказов."""
-        page = self._make_home_page([])
+        page = self._make_accepted_page([])
 
         with patch("src.scraper.chat.settings") as mock_settings:
             mock_settings.avtor24_base_url = "https://avtor24.ru"
@@ -797,8 +809,9 @@ class TestActiveOrdersParsing:
 
     @pytest.mark.asyncio
     async def test_get_active_chats_returns_ids(self):
-        """get_active_chats возвращает order_id из раздела «Активные»."""
-        page = self._make_home_page(self._ids(["11111", "22222", "33333"]))
+        """get_active_chats возвращает order_id из вкладки «Активные чаты»."""
+        # get_active_chats: 2 evaluates (tab click → True, extraction → ids)
+        page = self._make_home_page(["11111", "22222", "33333"])
 
         with patch("src.scraper.chat.settings") as mock_settings:
             mock_settings.avtor24_base_url = "https://avtor24.ru"
@@ -870,51 +883,9 @@ class TestActiveOrdersParsing:
                 await _navigate_home(page)
 
     @pytest.mark.asyncio
-    async def test_extract_order_ids_from_section_passes_keywords(self):
-        """_extract_order_ids_from_section передаёт ключевые слова в JS evaluate."""
-        page = MagicMock()
-        page.evaluate = AsyncMock(return_value=[{"id": "55555", "tag": ""}])
-
-        result = await _extract_order_ids_from_section(
-            page, ["Активные", "активные"]
-        )
-
-        assert result == ["55555"]
-        # Проверяем что evaluate вызван с ключевыми словами
-        page.evaluate.assert_awaited_once()
-        call_args = page.evaluate.call_args
-        assert call_args[0][1] == ["Активные", "активные"]
-
-    @pytest.mark.asyncio
-    async def test_accepted_and_active_chats_use_same_keywords(self):
-        """get_accepted_order_ids и get_active_chats ищут 'Активные' (не 'Ждут подтверждения')."""
-        page = self._make_home_page(self._ids(["99999"]))
-
-        with patch("src.scraper.chat.settings") as mock_settings:
-            mock_settings.avtor24_base_url = "https://avtor24.ru"
-
-            await get_accepted_order_ids(page)
-            call1_keywords = page.evaluate.call_args[0][1]
-
-            page.evaluate.reset_mock()
-            page.goto.reset_mock()
-
-            await get_active_chats(page)
-            call2_keywords = page.evaluate.call_args[0][1]
-
-        # Оба используют "Активные" keywords
-        assert "Активные" in call1_keywords
-        assert "Активные" in call2_keywords
-        # НЕ используют "Ждут подтверждения"
-        for kw in call1_keywords:
-            assert "Ждут подтверждения" not in kw
-        for kw in call2_keywords:
-            assert "Ждут подтверждения" not in kw
-
-    @pytest.mark.asyncio
     async def test_get_accepted_multiple_orders_deduped(self):
         """Дубликаты order_id не возвращаются (JS-уровень дедупликации)."""
-        page = self._make_home_page(self._ids(["11111", "22222"]))
+        page = self._make_accepted_page(["11111", "22222"])
 
         with patch("src.scraper.chat.settings") as mock_settings:
             mock_settings.avtor24_base_url = "https://avtor24.ru"
@@ -922,146 +893,56 @@ class TestActiveOrdersParsing:
 
         assert len(result) == len(set(result))
 
-    # --- Тесты фильтрации по тегам статусов ---
-
     @pytest.mark.asyncio
-    async def test_filters_out_completed_orders(self):
-        """Заказы с тегом 'завершен'/'завершён' не попадают в результат."""
-        items = [
-            {"id": "10001", "tag": ""},
-            {"id": "10002", "tag": "завершен"},
-            {"id": "10003", "tag": "Завершён"},
-            {"id": "10004", "tag": ""},
-        ]
-        page = self._make_home_page(items)
-
-        with patch("src.scraper.chat.settings") as mock_settings:
-            mock_settings.avtor24_base_url = "https://avtor24.ru"
-            result = await get_accepted_order_ids(page)
-
-        assert result == ["10001", "10004"]
-
-    @pytest.mark.asyncio
-    async def test_filters_out_waiting_confirmation(self):
-        """Заказы с тегом 'Ждёт подтверждения' не попадают в accepted."""
-        items = [
-            {"id": "20001", "tag": ""},
-            {"id": "20002", "tag": "Ждёт подтверждения"},
-            {"id": "20003", "tag": "ждет подтверждения"},
-        ]
-        page = self._make_home_page(items)
-
-        with patch("src.scraper.chat.settings") as mock_settings:
-            mock_settings.avtor24_base_url = "https://avtor24.ru"
-            result = await get_accepted_order_ids(page)
-
-        assert result == ["20001"]
-
-    @pytest.mark.asyncio
-    async def test_filters_out_cancelled_orders(self):
-        """Заказы с тегом 'отменен'/'отменён' не попадают в результат."""
-        items = [
-            {"id": "30001", "tag": "отменен"},
-            {"id": "30002", "tag": "Отменён"},
-            {"id": "30003", "tag": ""},
-        ]
-        page = self._make_home_page(items)
-
-        with patch("src.scraper.chat.settings") as mock_settings:
-            mock_settings.avtor24_base_url = "https://avtor24.ru"
-            result = await get_accepted_order_ids(page)
-
-        assert result == ["30003"]
-
-    @pytest.mark.asyncio
-    async def test_active_chats_also_filters_by_tags(self):
-        """get_active_chats тоже фильтрует по тегам."""
-        items = [
-            {"id": "40001", "tag": ""},
-            {"id": "40002", "tag": "завершен"},
-            {"id": "40003", "tag": "Ждёт подтверждения"},
-            {"id": "40004", "tag": ""},
-        ]
-        page = self._make_home_page(items)
-
-        with patch("src.scraper.chat.settings") as mock_settings:
-            mock_settings.avtor24_base_url = "https://avtor24.ru"
-            result = await get_active_chats(page)
-
-        assert result == ["40001", "40004"]
-
-    @pytest.mark.asyncio
-    async def test_mixed_tags_comprehensive(self):
-        """Комплексный тест: разные теги фильтруются корректно."""
-        items = [
-            {"id": "50001", "tag": ""},                         # в работе ✓
-            {"id": "50002", "tag": "завершен"},                 # ✗
-            {"id": "50003", "tag": "Ждёт подтверждения"},       # ✗
-            {"id": "50004", "tag": "отменен"},                  # ✗
-            {"id": "50005", "tag": "В работе"},                 # неизвестный тег = в работе ✓
-            {"id": "50006", "tag": ""},                         # в работе ✓
-        ]
-        page = self._make_home_page(items)
-
-        with patch("src.scraper.chat.settings") as mock_settings:
-            mock_settings.avtor24_base_url = "https://avtor24.ru"
-            result = await get_accepted_order_ids(page)
-
-        assert result == ["50001", "50005", "50006"]
-
-    @pytest.mark.asyncio
-    async def test_all_orders_filtered_returns_empty(self):
-        """Если все заказы завершены/ожидают — пустой список."""
-        items = [
-            {"id": "60001", "tag": "завершен"},
-            {"id": "60002", "tag": "Ждёт подтверждения"},
-        ]
-        page = self._make_home_page(items)
-
-        with patch("src.scraper.chat.settings") as mock_settings:
-            mock_settings.avtor24_base_url = "https://avtor24.ru"
-            result = await get_accepted_order_ids(page)
-
-        assert result == []
-
-    @pytest.mark.asyncio
-    async def test_extract_orders_with_tags_returns_tuples(self):
-        """_extract_orders_with_tags возвращает список кортежей (id, tag)."""
-        from src.scraper.chat import _extract_orders_with_tags
-
+    async def test_extract_visible_order_ids_returns_list(self):
+        """_extract_visible_order_ids возвращает список строк."""
         page = MagicMock()
-        page.evaluate = AsyncMock(return_value=[
-            {"id": "70001", "tag": "завершен"},
-            {"id": "70002", "tag": ""},
-        ])
+        page.evaluate = AsyncMock(return_value=["70001", "70002"])
 
-        result = await _extract_orders_with_tags(page, ["Активные"])
-        assert result == [("70001", "завершен"), ("70002", "")]
+        result = await _extract_visible_order_ids(page)
+        assert result == ["70001", "70002"]
+
+    @pytest.mark.asyncio
+    async def test_click_home_tab_returns_true_on_success(self):
+        """_click_home_tab возвращает True когда вкладка найдена и кликнута."""
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=True)
+
+        result = await _click_home_tab(page, "В работе")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_click_home_tab_returns_false_when_not_found(self):
+        """_click_home_tab возвращает False когда вкладка не найдена."""
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=False)
+
+        result = await _click_home_tab(page, "Несуществующая")
+        assert result is False
 
 
 # ===== Тесты get_waiting_confirmation_order_ids =====
 
 class TestWaitingConfirmation:
-    """Тесты функции get_waiting_confirmation_order_ids()."""
+    """Тесты функции get_waiting_confirmation_order_ids().
+
+    Новая логика: кликает вкладку «Ждут подтверждения», затем извлекает order_id.
+    evaluate вызывается 2 раза: tab click (True) + extraction (list[str]).
+    """
 
     @staticmethod
-    def _make_home_page(evaluate_result, url="https://avtor24.ru/home"):
+    def _make_home_page(order_ids: list[str], url="https://avtor24.ru/home"):
+        """Мок: goto → tab click (True) → extraction (order_ids)."""
         page = MagicMock()
         page.url = url
         page.goto = AsyncMock()
-        page.evaluate = AsyncMock(return_value=evaluate_result)
+        page.evaluate = AsyncMock(side_effect=[True, order_ids])
         return page
 
     @pytest.mark.asyncio
-    async def test_returns_only_waiting_orders(self):
-        """Возвращает только заказы с тегом 'Ждёт подтверждения'."""
-        items = [
-            {"id": "10001", "tag": ""},
-            {"id": "10002", "tag": "Ждёт подтверждения"},
-            {"id": "10003", "tag": "завершен"},
-            {"id": "10004", "tag": "ждет подтверждения"},
-        ]
-        page = self._make_home_page(items)
+    async def test_returns_waiting_orders(self):
+        """Возвращает order_id из вкладки «Ждут подтверждения»."""
+        page = self._make_home_page(["10002", "10004"])
 
         with patch("src.scraper.chat.settings") as mock_settings:
             mock_settings.avtor24_base_url = "https://avtor24.ru"
@@ -1071,12 +952,8 @@ class TestWaitingConfirmation:
 
     @pytest.mark.asyncio
     async def test_returns_empty_when_no_waiting(self):
-        """Возвращает [] если нет заказов 'Ждёт подтверждения'."""
-        items = [
-            {"id": "20001", "tag": ""},
-            {"id": "20002", "tag": "завершен"},
-        ]
-        page = self._make_home_page(items)
+        """Возвращает [] если вкладка «Ждут подтверждения» пуста."""
+        page = self._make_home_page([])
 
         with patch("src.scraper.chat.settings") as mock_settings:
             mock_settings.avtor24_base_url = "https://avtor24.ru"
@@ -1104,6 +981,20 @@ class TestWaitingConfirmation:
         page.url = "https://avtor24.ru/home"
         page.goto = AsyncMock()
         page.evaluate = AsyncMock(side_effect=Exception("JS error"))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_waiting_confirmation_order_ids(page)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_tab_not_found(self):
+        """Возвращает [] если вкладка «Ждут подтверждения» не найдена."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/home"
+        page.goto = AsyncMock()
+        page.evaluate = AsyncMock(return_value=False)  # tab not found
 
         with patch("src.scraper.chat.settings") as mock_settings:
             mock_settings.avtor24_base_url = "https://avtor24.ru"
