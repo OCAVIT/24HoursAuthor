@@ -1078,6 +1078,7 @@ async def chat_responder_job() -> None:
 
                 # Пропускаем завершённые/отменённые заказы
                 if order.status in ("delivered", "completed", "rejected", "cancelled"):
+                    logger.debug("Чат %s пропущен: статус '%s'", avtor24_id, order.status)
                     continue
 
                 # Получаем историю сообщений
@@ -1411,8 +1412,22 @@ async def check_accepted_bids_job() -> None:
                 elif order.status == "accepted":
                     # Уже accepted — не переводим повторно
                     continue
+                elif order.status in ("error", "generating", "checking_plagiarism", "rewriting"):
+                    # Заказ был в обработке, но что-то пошло не так — повторяем
+                    await browser_manager.random_delay(min_sec=2, max_sec=5)
+                    try:
+                        await _retry_async(confirm_order, page, oid)
+                    except Exception:
+                        pass  # Кнопка "Подтвердить" может отсутствовать
+                    async with async_session() as session:
+                        await update_order_status(session, order.id, "accepted")
+                    await _log_action(
+                        "accept",
+                        f"Заказ #{oid} сброшен из '{order.status}' → 'accepted' (повтор)",
+                        order_id=order.id,
+                    )
                 elif order.status != "bid_placed":
-                    # Статус не bid_placed и не accepted — не трогаем
+                    # Статус не bid_placed и не accepted — не трогаем (delivered, completed, etc.)
                     continue
                 else:
                     # bid_placed → accepted
