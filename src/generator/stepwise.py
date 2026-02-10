@@ -115,18 +115,19 @@ def _extract_cited_references(sections: list[GeneratedSection]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 _BANNED_PHRASES_MAP = {
+    # --- Классические AI-маркеры ---
     "таким образом,": "",
     "таким образом ": "",
     "стоит отметить, что ": "",
     "стоит отметить,": "",
+    "стоит подчеркнуть, что ": "",
+    "стоит подчеркнуть,": "",
     "необходимо отметить, что ": "",
     "необходимо отметить,": "",
     "следует подчеркнуть, что ": "",
     "следует подчеркнуть,": "",
     "следует отметить, что ": "",
     "следует отметить,": "",
-    "в заключение следует отметить, что ": "",
-    "в заключение следует отметить,": "",
     "не менее важным является ": "",
     "особое внимание следует уделить ": "",
     "важно понимать, что ": "",
@@ -139,6 +140,44 @@ _BANNED_PHRASES_MAP = {
     "представляется целесообразным ": "",
     "в данном контексте ": "",
     "в данном контексте,": "",
+    "в свою очередь,": "",
+    "в свою очередь ": "",
+    "в связи с этим,": "",
+    "в связи с этим ": "",
+    "кроме того, стоит подчеркнуть,": "",
+    "кроме того, стоит подчеркнуть ": "",
+    # --- Обобщающие концовки разделов ---
+    "в заключение следует отметить, что ": "",
+    "в заключение следует отметить,": "",
+    "в заключение можно сказать, что ": "",
+    "в заключение можно сказать,": "",
+    "в заключение можно отметить, что ": "",
+    "в заключение можно отметить,": "",
+    "в заключение можно констатировать, что ": "",
+    "в заключение можно констатировать,": "",
+    "в заключение данного ": "",
+    # --- Анонимные исследования ---
+    "исследования показывают, что ": "",
+    "исследования показывают ": "",
+    "исследования свидетельствуют, что ": "",
+    "исследования свидетельствуют о том, что ": "",
+    "исследования свидетельствуют о ": "",
+    "по данным исследований,": "",
+    "по данным исследований ": "",
+    "по данным многочисленных исследований,": "",
+    "по данным многочисленных исследований ": "",
+    "учёные доказали, что ": "",
+    "учёные установили, что ": "",
+    "учёные показали, что ": "",
+    "исследователи полагают, что ": "",
+    "исследователи установили, что ": "",
+    "исследователи отмечают, что ": "",
+    "как показывают исследования,": "",
+    "как показывают исследования ": "",
+    "как свидетельствуют исследования,": "",
+    "как свидетельствуют исследования ": "",
+    "многочисленные исследования подтверждают, что ": "",
+    "многочисленные исследования показывают, что ": "",
 }
 
 # Compile once for performance
@@ -356,8 +395,21 @@ async def generate_section(
             "\n- Формат: Автор, И. О. Название работы / И. О. Автор. — Город: Издательство, Год. — Страниц с."
             "\n- Для зарубежных: Author, A. B. Title / A. B. Author. — City: Publisher, Year. — Pages p."
             "\n- Расположи в алфавитном порядке: сначала русскоязычные, затем иностранные."
-            "\n- НЕ выдумывай несуществующих книг — используй реальные, широко известные работы."
             "\n- Каждая строка начинается с порядкового номера: 1. ..., 2. ..., и т.д."
+            "\n"
+            "\nОБЯЗАТЕЛЬНО — ИМЕНИТЕЛЬНЫЙ ПАДЕЖ:"
+            "\n- Фамилии авторов в библиографии ТОЛЬКО в ИМЕНИТЕЛЬНОМ падеже."
+            "\n- ПРАВИЛЬНО: Выготский, Л. С. / Томлинсон, К. / Петров, В. В."
+            "\n- НЕПРАВИЛЬНО: Выготского, Л. С. / Томлинсона, К. / Петрова, В. В."
+            "\n- Если автор упоминается в тексте как 'Виготского (1934)', в библиографии"
+            "\n  пишем 'Выготский, Л. С.' — именительный падеж, правильная транслитерация."
+            "\n"
+            "\nЗАПРЕТ НА ФАБРИКАЦИЮ:"
+            "\n- НЕ выдумывай книг с шаблонными названиями ('Педагогические инновации',"
+            "\n  'Инновации в образовании', 'Современные методы обучения')."
+            "\n- Используй РЕАЛЬНЫЕ, широко известные работы каждого автора."
+            "\n- У каждого автора должна быть КОНКРЕТНАЯ, узнаваемая книга или статья по теме."
+            "\n- Если не знаешь реальную работу автора — лучше пропусти, чем выдумывай."
             f"{refs_hint}"
         )
     # Инструкции для вводного абзаца главы или заключения
@@ -508,6 +560,172 @@ def assemble_text(sections: list[GeneratedSection], uppercase_names: bool = True
     return normalize_text("\n\n".join(parts))
 
 
+def _clean_bibliography(text: str) -> str:
+    """Постпроцессинг библиографии: дедупликация, сортировка, перенумерация.
+
+    1. Разбить на отдельные записи (по номерам: 1. ..., 2. ...)
+    2. Удалить дубликаты (по автору + году)
+    3. Сортировать: русские → иностранные, алфавитно
+    4. Перенумеровать
+    """
+    # Извлечь отдельные записи
+    entries = re.split(r'\n(?=\d+\.)', text.strip())
+    cleaned = []
+    seen_keys: set[str] = set()
+
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        # Убрать номер для нормализации
+        without_num = re.sub(r'^\d+\.\s*', '', entry).strip()
+        if not without_num:
+            continue
+
+        # Ключ дедупликации: первые 30 символов (автор + начало названия) в нижнем регистре
+        # + год (если найден)
+        year_match = re.search(r'(\d{4})', without_num)
+        year = year_match.group(1) if year_match else ""
+        # Берём начало записи до первого разделителя / — .
+        key_text = re.split(r'[/\—\-]', without_num)[0].strip().lower()[:40]
+        dedup_key = f"{key_text}_{year}"
+
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        cleaned.append(without_num)
+
+    # Сортировка: русские → иностранные, алфавитно
+    russian = [e for e in cleaned if re.match(r'[А-ЯЁа-яё]', e)]
+    foreign = [e for e in cleaned if not re.match(r'[А-ЯЁа-яё]', e)]
+    russian.sort(key=str.lower)
+    foreign.sort(key=str.lower)
+
+    # Перенумеровать
+    final = []
+    for i, entry in enumerate(russian + foreign, 1):
+        final.append(f"{i}. {entry}")
+
+    return "\n".join(final)
+
+
+def _find_missing_in_bibliography(bib_text: str, cited_authors: list[str]) -> list[str]:
+    """Найти цитируемых авторов, которые отсутствуют в тексте библиографии.
+
+    Сопоставление нечёткое: ищем фамилию (без падежных окончаний) и год.
+    """
+    bib_lower = bib_text.lower()
+    missing = []
+    for ref in cited_authors:
+        # ref = "Выготский (1934)" или "Tomlinson (2001)"
+        m = re.match(r'(.+?)\s*\((\d{4})\)', ref)
+        if not m:
+            continue
+        surname = m.group(1).strip()
+        year = m.group(2)
+
+        # Для русских: берём основу фамилии (без окончания -а, -ой, -ого и т.д.)
+        if re.match(r'[А-ЯЁ]', surname):
+            stem = re.sub(r'(ой|ого|ину|ина|ова|ева|ёва|ый|ий|а)$', '', surname.lower())
+            # Минимум 3 символа основы
+            if len(stem) < 3:
+                stem = surname.lower()[:4]
+        else:
+            stem = surname.lower()
+
+        # Ищем основу фамилии + год в тексте библиографии
+        if stem in bib_lower and year in bib_text:
+            # Проверяем что год рядом с фамилией (в пределах одной записи ~500 символов)
+            for pos in [m.start() for m in re.finditer(re.escape(stem), bib_lower)]:
+                chunk = bib_text[max(0, pos - 50):pos + 300]
+                if year in chunk:
+                    break
+            else:
+                missing.append(ref)
+        else:
+            missing.append(ref)
+    return missing
+
+
+async def _validate_bibliography(
+    bib_section: GeneratedSection,
+    cited_authors: list[str],
+    title: str,
+    subject: str,
+    system_prompt: str,
+) -> tuple[GeneratedSection, dict]:
+    """Проверить библиографию на пропущенных авторов и дополнить при необходимости.
+
+    Возвращает (обновлённую секцию, токены). Если пропусков нет — возвращает оригинал.
+    """
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+
+    for attempt in range(2):  # Максимум 2 попытки дополнения
+        missing = _find_missing_in_bibliography(bib_section.text, cited_authors)
+        if not missing:
+            logger.info("Библиография: все цитируемые авторы найдены")
+            break
+
+        logger.warning(
+            "Библиография: %d авторов не найдены (попытка %d): %s",
+            len(missing), attempt + 1, ", ".join(missing[:10]),
+        )
+
+        # Дополнительный API-вызов: добавить недостающие записи
+        result = await chat_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": (
+                    f"Тема работы: \"{title}\"\nПредмет: {subject}\n\n"
+                    f"В тексте работы цитируются следующие авторы, но их НЕТ в списке литературы:\n"
+                    + "\n".join(f"- {ref}" for ref in missing)
+                    + "\n\nДопиши ТОЛЬКО недостающие библиографические записи для этих авторов."
+                    "\nФормат СТРОГО по ГОСТ Р 7.0.5-2008."
+                    "\nФамилия автора ОБЯЗАТЕЛЬНО в ИМЕНИТЕЛЬНОМ падеже (Выготский, а не Выготского)."
+                    "\nГод издания ОБЯЗАТЕЛЬНО должен совпадать с годом в скобках."
+                    "\nНапример: для 'Хатти (2009)' нужно: Хатти, Дж. Видимое обучение / Дж. Хатти. — М.: Национальное образование, 2009. — 496 с."
+                    "\nИспользуй РЕАЛЬНЫЕ, широко известные работы этих авторов."
+                    "\nНумерацию продолжай с номера, следующего за последним в текущем списке."
+                    "\nВерни ТОЛЬКО новые записи, без существующих."
+                )},
+            ],
+            model=settings.openai_model_main,
+            temperature=0.3,
+            max_tokens=2000,
+        )
+        total_input += result["input_tokens"]
+        total_output += result["output_tokens"]
+        total_cost += result["cost_usd"]
+
+        extra_entries = result["content"].strip()
+        if extra_entries:
+            # Добавляем новые записи к библиографии
+            combined = bib_section.text.rstrip() + "\n\n" + extra_entries
+            # Дедупликация + перенумерация
+            combined = _clean_bibliography(combined)
+            bib_section = GeneratedSection(
+                name=bib_section.name,
+                text=combined,
+                target_words=bib_section.target_words,
+            )
+
+    # Финальная очистка библиографии (дедупликация, сортировка, перенумерация)
+    bib_section = GeneratedSection(
+        name=bib_section.name,
+        text=_clean_bibliography(bib_section.text),
+        target_words=bib_section.target_words,
+    )
+
+    tokens_info = {
+        "input_tokens": total_input,
+        "output_tokens": total_output,
+        "cost_usd": total_cost,
+    }
+    return bib_section, tokens_info
+
+
 async def stepwise_generate(
     work_type: str,
     title: str,
@@ -621,6 +839,19 @@ async def stepwise_generate(
             )
             sw.sections.append(generated)
             _accumulate(sw, tokens_info)
+
+            # Валидация: проверяем, все ли цитируемые авторы попали в библиографию
+            if cited_authors:
+                generated, extra_tokens = await _validate_bibliography(
+                    bib_section=generated,
+                    cited_authors=cited_authors,
+                    title=title,
+                    subject=subject,
+                    system_prompt=system_prompt,
+                )
+                # Заменяем секцию на исправленную
+                sw.sections[-1] = generated
+                _accumulate(sw, extra_tokens)
 
     # Шаг 3: Расширение до целевого объёма
     sw.sections, tokens_info = await expand_to_target(
