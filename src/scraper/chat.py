@@ -28,10 +28,20 @@ class ChatMessage:
     is_system: bool = False  # "Вы сделали ставку", "Вас выбрали автором" и т.д.
     has_files: bool = False  # Есть ли прикреплённые файлы
     file_urls: list = None  # URL файлов для скачивания
+    sender_name: Optional[str] = None  # Имя отправителя ("Ассистент", имя заказчика, etc.)
 
     def __post_init__(self):
         if self.file_urls is None:
             self.file_urls = []
+
+    @property
+    def is_assistant(self) -> bool:
+        """Сообщение от платформенного Ассистента (изменение условий заказа)."""
+        if self.sender_name and "ассистент" in self.sender_name.lower():
+            return True
+        if self.is_system and self.text and "ассистент" in self.text.lower():
+            return True
+        return False
 
 
 def _order_page_url(order_id: str) -> str:
@@ -164,6 +174,18 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
 
                     const isSystem = !!item.querySelector('[class*="MessageSystemStyled"]');
 
+                    // Извлекаем имя отправителя из заголовка группы
+                    let senderName = '';
+                    const group = item.closest('[class*="GroupStyled"], [class*="Group"]');
+                    if (group) {
+                        const nameEl = group.querySelector(
+                            '[class*="NameStyled"], [class*="Name"], [class*="AuthorName"], [class*="Sender"]'
+                        );
+                        if (nameEl) {
+                            senderName = (nameEl.textContent || '').trim();
+                        }
+                    }
+
                     // Определяем направление
                     // На Avtor24: у исходящих сообщений MessageBaseStyled
                     // имеет другой стиль/цвет (обычно синий/серый)
@@ -223,6 +245,7 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                         timestamp,
                         hasFiles: fileUrls.length > 0,
                         fileUrls: fileUrls,
+                        senderName: senderName,
                     });
                 });
 
@@ -234,6 +257,7 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
         for msg in raw:
             file_urls = msg.get("fileUrls", [])
             has_files = msg.get("hasFiles", False) or len(file_urls) > 0
+            sender_name = msg.get("senderName", "") or None
             if msg.get("isSystem"):
                 result.append(ChatMessage(
                     order_id=order_id,
@@ -243,6 +267,7 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                     is_system=True,
                     has_files=has_files,
                     file_urls=file_urls,
+                    sender_name=sender_name,
                 ))
             else:
                 result.append(ChatMessage(
@@ -252,6 +277,7 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                     timestamp=msg.get("timestamp"),
                     has_files=has_files,
                     file_urls=file_urls,
+                    sender_name=sender_name,
                 ))
 
         return result
@@ -261,55 +287,214 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
         return []
 
 
-async def get_active_chats(page: Page) -> list[str]:
-    """Получить список order_id с новыми сообщениями.
+async def _navigate_home(page: Page) -> bool:
+    """Перейти на /home и дождаться загрузки.
 
-    Проверяет /home на наличие активных чатов с непрочитанными.
+    Returns True если страница загрузилась, False при ошибке/redirect на login.
     """
+    home_url = f"{settings.avtor24_base_url}/home"
     try:
-        home_url = f"{settings.avtor24_base_url}/home"
-        try:
-            await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as nav_err:
-            if "ERR_ABORTED" in str(nav_err):
-                # SPA может перенаправить — пробуем дождаться загрузки
-                logger.debug("ERR_ABORTED на /home, ждём загрузки страницы...")
-                await asyncio.sleep(5)
-                # Проверяем, загрузилась ли страница
-                if "/login" in page.url:
-                    logger.warning("Сессия истекла, требуется повторный логин")
-                    return []
-            else:
-                raise
-        await asyncio.sleep(5)
+        await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as nav_err:
+        if "ERR_ABORTED" in str(nav_err):
+            logger.debug("ERR_ABORTED на /home, ждём загрузки страницы...")
+            await asyncio.sleep(5)
+            if "/login" in page.url:
+                logger.warning("Сессия истекла, требуется повторный логин")
+                return False
+        else:
+            raise
+    await asyncio.sleep(5)
+    return True
 
-        order_ids = await page.evaluate("""
-            () => {
-                const root = document.querySelector('#root');
-                if (!root) return [];
 
-                const ids = [];
-                // Ищем ссылки на заказы в чатах
+async def _extract_order_ids_from_section(page: Page, section_keywords: list[str]) -> list[str]:
+    """Извлечь order_id из определённой секции на /home (без тегов статусов).
+
+    Обёртка над _extract_orders_with_tags, возвращает только id.
+    """
+    items = await _extract_orders_with_tags(page, section_keywords)
+    return [oid for oid, _tag in items]
+
+
+async def _extract_orders_with_tags(
+    page: Page, section_keywords: list[str],
+) -> list[tuple[str, str]]:
+    """Извлечь order_id + тег статуса из секции на /home.
+
+    Args:
+        page: Playwright page (уже на /home).
+        section_keywords: список ключевых слов для поиска заголовка секции.
+
+    Returns:
+        Список кортежей (order_id, status_tag).
+        status_tag — текст тега рядом с чатом, например "завершен", "Ждёт подтверждения", "" (пусто).
+    """
+    raw: list[dict] = await page.evaluate("""
+        (keywords) => {
+            const root = document.querySelector('#root');
+            if (!root) return [];
+
+            const results = [];
+            const seen = new Set();
+
+            // Ищем секцию по заголовку
+            let section = null;
+            const candidates = root.querySelectorAll(
+                'h2, h3, h4, [class*="Title"], [class*="Header"], [class*="Tab"], div, span'
+            );
+            for (const el of candidates) {
+                const text = (el.textContent || '').trim();
+                const matches = keywords.some(kw => text.includes(kw));
+                if (matches) {
+                    section = el.closest(
+                        'section, [class*="Section"], [class*="Block"], [class*="Container"], [class*="List"]'
+                    ) || el.parentElement;
+                    break;
+                }
+            }
+
+            const container = section || root;
+
+            // Для каждой ссылки на заказ находим ближайший элемент-карточку
+            // и извлекаем из неё тег статуса (badge / label)
+            container.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
+                const match = a.href.match(/getoneorder\\/(\\d+)/);
+                if (!match || seen.has(match[1])) return;
+                seen.add(match[1]);
+
+                // Ищем карточку-контейнер чата (ближайший родитель)
+                const card = a.closest(
+                    '[class*="Card"], [class*="Item"], [class*="Chat"], [class*="Order"], li, article'
+                ) || a.parentElement;
+
+                // Ищем тег статуса внутри карточки
+                let tag = '';
+                if (card) {
+                    // Ищем badge/label элементы
+                    const badgeEls = card.querySelectorAll(
+                        '[class*="Badge"], [class*="Status"], [class*="Tag"], [class*="Label"], ' +
+                        '[class*="badge"], [class*="status"], [class*="tag"], [class*="label"]'
+                    );
+                    for (const badge of badgeEls) {
+                        const badgeText = (badge.textContent || '').trim();
+                        if (badgeText) {
+                            tag = badgeText;
+                            break;
+                        }
+                    }
+                    // Fallback: ищем мелкий текст с ключевыми словами статуса
+                    if (!tag) {
+                        const spans = card.querySelectorAll('span, small, div');
+                        for (const s of spans) {
+                            const t = (s.textContent || '').trim().toLowerCase();
+                            if (t.includes('завершен') || t.includes('завершён') ||
+                                t.includes('ждёт подтверждения') || t.includes('ждет подтверждения') ||
+                                t.includes('отменен') || t.includes('отменён')) {
+                                tag = (s.textContent || '').trim();
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                results.push({ id: match[1], tag: tag });
+            });
+
+            // Fallback — если секцию не нашли
+            if (!section) {
                 root.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
                     const match = a.href.match(/getoneorder\\/(\\d+)/);
-                    if (match) ids.push(match[1]);
+                    if (!match || seen.has(match[1])) return;
+                    seen.add(match[1]);
+                    results.push({ id: match[1], tag: '' });
                 });
-
-                // Также проверяем элементы с unread индикаторами
-                root.querySelectorAll('[class*="ChatItem"], [class*="Chat"]').forEach(el => {
-                    const link = el.querySelector('a[href*="/order/"]');
-                    if (link) {
-                        const match = link.href.match(/getoneorder\\/(\\d+)/);
-                        if (match && !ids.includes(match[1])) ids.push(match[1]);
-                    }
-                });
-
-                return ids;
             }
-        """)
 
-        logger.info("Найдено %d чатов с новыми сообщениями", len(order_ids))
-        return order_ids
+            return results;
+        }
+    """, section_keywords)
+
+    return [(item["id"], item.get("tag", "")) for item in raw]
+
+
+# Теги статусов, означающие "не в работе" — пропускаем
+_SKIP_TAGS = {"завершен", "завершён", "отменен", "отменён"}
+_WAITING_TAGS = {"ждёт подтверждения", "ждет подтверждения"}
+
+
+async def get_accepted_order_ids(page: Page) -> list[str]:
+    """Получить order_id из раздела «Активные» (чаты) на /home.
+
+    Это заказы, где заказчик уже выбрал нас автором и работа в процессе.
+    Используется для перевода bid_placed → accepted.
+
+    Фильтрация по тегам:
+    - «завершен» / «отменен» → пропускаем
+    - «ждёт подтверждения» → тоже пропускаем (ещё не приняты)
+    - Без тега или другой тег → возвращаем (в работе)
+    """
+    try:
+        if not await _navigate_home(page):
+            return []
+
+        items = await _extract_orders_with_tags(
+            page,
+            ["Активные", "активные", "Активные чаты", "активные чаты"],
+        )
+
+        # Фильтруем: только «в работе» (ни завершён, ни ждёт подтверждения)
+        active_ids = []
+        for oid, tag in items:
+            tag_lower = tag.lower().strip()
+            if any(skip in tag_lower for skip in _SKIP_TAGS):
+                continue
+            if any(wait in tag_lower for wait in _WAITING_TAGS):
+                continue
+            active_ids.append(oid)
+
+        if active_ids:
+            logger.info(
+                "Найдено %d заказов в работе в разделе «Активные» на /home (из %d всего)",
+                len(active_ids), len(items),
+            )
+        return active_ids
+
+    except Exception as e:
+        logger.error("Ошибка получения активных заказов с /home: %s", e)
+        return []
+
+
+async def get_active_chats(page: Page) -> list[str]:
+    """Получить список order_id с активными чатами (в работе).
+
+    Проверяет /home на наличие активных чатов.
+    Пропускает завершённые и ожидающие подтверждения.
+    """
+    try:
+        if not await _navigate_home(page):
+            return []
+
+        items = await _extract_orders_with_tags(
+            page,
+            ["Активные", "активные", "Активные чаты", "активные чаты"],
+        )
+
+        # Фильтруем: только «в работе»
+        active_ids = []
+        for oid, tag in items:
+            tag_lower = tag.lower().strip()
+            if any(skip in tag_lower for skip in _SKIP_TAGS):
+                continue
+            if any(wait in tag_lower for wait in _WAITING_TAGS):
+                continue
+            active_ids.append(oid)
+
+        logger.info(
+            "Найдено %d активных чатов (в работе) из %d всего",
+            len(active_ids), len(items),
+        )
+        return active_ids
 
     except Exception as e:
         logger.error("Ошибка получения списка чатов: %s", e)

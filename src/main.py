@@ -94,6 +94,63 @@ async def _log_action(action: str, details: str = "", order_id: int | None = Non
     })
 
 
+async def _ensure_order_in_db(page, avtor24_id: str, status: str = "accepted"):
+    """Убедиться что заказ есть в БД. Если нет — спарсить детали и создать запись.
+
+    Используется в chat_responder_job и check_accepted_bids_job, когда
+    заказ обнаружен в «Активных» на /home, но записи в БД нет
+    (например, ставку поставили вручную на сайте).
+
+    Returns:
+        Order | None — запись из БД (найденная или только что созданная).
+    """
+    from src.scraper.order_detail import fetch_order_detail
+    from src.scraper.browser import browser_manager
+
+    async with async_session() as session:
+        order = await get_order_by_avtor24_id(session, avtor24_id)
+    if order:
+        return order
+
+    # Заказа нет — парсим детальную страницу и создаём запись
+    try:
+        detail_url = f"/order/getoneorder/{avtor24_id}"
+        await browser_manager.random_delay(min_sec=2, max_sec=5)
+        detail = await _retry_async(fetch_order_detail, page, detail_url)
+        if detail is None:
+            logger.warning("Не удалось спарсить детали заказа %s", avtor24_id)
+            return None
+
+        async with async_session() as session:
+            order = await create_order(
+                session,
+                avtor24_id=avtor24_id,
+                title=detail.title or f"Заказ #{avtor24_id}",
+                work_type=detail.work_type or None,
+                subject=detail.subject or None,
+                description=detail.description or None,
+                pages_min=detail.pages_min,
+                pages_max=detail.pages_max,
+                font_size=detail.font_size or 14,
+                line_spacing=detail.line_spacing or 1.5,
+                required_uniqueness=detail.required_uniqueness,
+                antiplagiat_system=detail.antiplagiat_system or None,
+                budget_rub=detail.budget_rub,
+                customer_username=detail.customer_name or None,
+                status=status,
+            )
+        await _log_action(
+            "accept",
+            f"Заказ #{avtor24_id} обнаружен в «Активных», но не был в БД — создан со статусом '{status}'",
+            order_id=order.id,
+        )
+        return order
+    except Exception as e:
+        logger.warning("Ошибка создания заказа %s из активных: %s", avtor24_id, e)
+        await _log_action("error", f"Не удалось создать запись для заказа #{avtor24_id}: {e}")
+        return None
+
+
 async def _retry_async(coro_func, *args, max_retries: int = 3, **kwargs):
     """Повторить вызов async-функции с экспоненциальным backoff при сетевых ошибках."""
     for attempt in range(max_retries):
@@ -732,6 +789,99 @@ async def process_accepted_orders_job() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Обработка сообщений Ассистента (изменение условий заказа)
+# ---------------------------------------------------------------------------
+
+async def _handle_assistant_messages(
+    page,
+    avtor24_id: str,
+    order,
+    assistant_msgs: list,
+) -> None:
+    """Обработать сообщения Ассистента: перепарсить условия заказа с детальной страницы.
+
+    Ассистент на Автор24 отправляет сообщения об изменении условий заказа.
+    Мы заходим на страницу заказа, парсим новые условия и обновляем БД.
+    Если условия неприемлемые — можно отменить заказ (кнопка "Отменить").
+    """
+    from src.scraper.order_detail import fetch_order_detail
+    from src.scraper.browser import browser_manager
+    from src.database.crud import update_order_fields
+
+    try:
+        await _log_action(
+            "chat",
+            f"Обнаружено {len(assistant_msgs)} сообщений Ассистента, перепарсинг условий",
+            order_id=order.id,
+        )
+
+        # Переходим на страницу заказа и парсим актуальные условия
+        order_url = f"/order/getoneorder/{avtor24_id}"
+        detail = await _retry_async(fetch_order_detail, page, order_url)
+
+        # Собираем поля для обновления (только изменившиеся)
+        update_kwargs = {}
+        if detail.description and detail.description != (order.description or ""):
+            update_kwargs["description"] = detail.description
+        if detail.required_uniqueness and detail.required_uniqueness != order.required_uniqueness:
+            update_kwargs["required_uniqueness"] = detail.required_uniqueness
+        if detail.antiplagiat_system and detail.antiplagiat_system != (order.antiplagiat_system or ""):
+            update_kwargs["antiplagiat_system"] = detail.antiplagiat_system
+        if detail.pages_min and detail.pages_min != order.pages_min:
+            update_kwargs["pages_min"] = detail.pages_min
+        if detail.pages_max and detail.pages_max != order.pages_max:
+            update_kwargs["pages_max"] = detail.pages_max
+        if detail.font_size and detail.font_size != (order.font_size or 14):
+            update_kwargs["font_size"] = detail.font_size
+        if detail.line_spacing and detail.line_spacing != (order.line_spacing or 1.5):
+            update_kwargs["line_spacing"] = detail.line_spacing
+        if detail.budget_rub and detail.budget_rub != order.budget_rub:
+            update_kwargs["budget_rub"] = detail.budget_rub
+        if detail.deadline and detail.deadline != (str(order.deadline) if order.deadline else None):
+            update_kwargs["deadline"] = detail.deadline
+        if detail.title and detail.title != order.title:
+            update_kwargs["title"] = detail.title
+
+        if update_kwargs:
+            async with async_session() as session:
+                await update_order_fields(session, order.id, **update_kwargs)
+            changes_str = ", ".join(f"{k}={v}" for k, v in update_kwargs.items())
+            await _log_action(
+                "chat",
+                f"Условия заказа #{avtor24_id} обновлены: {changes_str}",
+                order_id=order.id,
+            )
+
+            async with async_session() as session:
+                await push_notification(
+                    session,
+                    type="new_message",
+                    title=f"Условия изменены: заказ #{avtor24_id}",
+                    body={
+                        "order_id": avtor24_id,
+                        "customer_message": f"Ассистент: условия заказа изменены ({changes_str})",
+                        "auto_reply": "",
+                        "auto_replied": False,
+                    },
+                    order_id=order.id,
+                )
+        else:
+            await _log_action(
+                "chat",
+                f"Сообщение Ассистента по заказу #{avtor24_id}, условия не изменились",
+                order_id=order.id,
+            )
+
+    except Exception as e:
+        logger.warning("Ошибка обработки сообщений Ассистента для %s: %s", avtor24_id, e)
+        await _log_action(
+            "error",
+            f"Ошибка обработки Ассистента для #{avtor24_id}: {e}",
+            order_id=order.id,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Задача 3: Чат-респондер
 # ---------------------------------------------------------------------------
 
@@ -766,11 +916,13 @@ async def chat_responder_job() -> None:
             if _shutting_down or not bot_running:
                 break
             try:
-                # Ищем заказ в БД
+                # Ищем заказ в БД; если нет — парсим и создаём
                 async with async_session() as session:
                     order = await get_order_by_avtor24_id(session, avtor24_id)
                 if not order:
-                    continue
+                    order = await _ensure_order_in_db(page, avtor24_id, status="accepted")
+                    if not order:
+                        continue
 
                 # Получаем историю сообщений
                 await browser_manager.random_delay(min_sec=2, max_sec=5)
@@ -778,8 +930,22 @@ async def chat_responder_job() -> None:
                 if not chat_messages:
                     continue
 
+                # --- Обработка сообщений Ассистента (изменение условий заказа) ---
+                assistant_msgs = [m for m in chat_messages if m.is_assistant]
+                if assistant_msgs:
+                    await _handle_assistant_messages(
+                        page, avtor24_id, order, assistant_msgs,
+                    )
+                    # Перечитываем заказ из БД (мог обновиться)
+                    async with async_session() as session:
+                        order = await get_order_by_avtor24_id(session, avtor24_id)
+                    if not order:
+                        continue
+
                 # Последнее сообщение — от заказчика?
                 last_msg = chat_messages[-1]
+                if last_msg.is_assistant:
+                    continue  # Ассистент — не отвечаем
                 if not last_msg.is_incoming:
                     continue  # Последнее — наше, ответ не нужен
 
@@ -986,7 +1152,7 @@ async def daily_summary_job() -> None:
 async def check_accepted_bids_job() -> None:
     """Проверить, приняли ли заказчики наши ставки (перевод bid_placed → accepted).
 
-    Проверяет /home — раздел «Ждут подтверждения» содержит принятые заказы.
+    Проверяет /home — раздел «Активные» (активные чаты) содержит принятые заказы.
     """
     if not bot_running or _shutting_down:
         return
@@ -996,6 +1162,7 @@ async def check_accepted_bids_job() -> None:
 
     from src.scraper.auth import login
     from src.scraper.browser import browser_manager
+    from src.scraper.chat import get_accepted_order_ids
 
     await _track_task()
     _page_locked = False
@@ -1004,64 +1171,13 @@ async def check_accepted_bids_job() -> None:
         await browser_manager.page_lock.acquire()
         _page_locked = True
 
-        # Переходим на главную — там раздел "Ждут подтверждения"
-        home_url = f"{settings.avtor24_base_url}/home"
-        try:
-            await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
-        except Exception as nav_err:
-            if "ERR_ABORTED" in str(nav_err):
-                logger.debug("ERR_ABORTED на /home, ждём загрузки...")
-                await asyncio.sleep(5)
-                if "/login" in page.url:
-                    logger.warning("Сессия истекла при проверке принятых заказов")
-                    return
-            else:
-                raise
-        await browser_manager.short_delay()
-
-        # Извлекаем order_id из раздела «Ждут подтверждения» через JS
-        pending_order_ids = await page.evaluate("""
-            () => {
-                const root = document.querySelector('#root');
-                if (!root) return [];
-
-                const ids = [];
-                // Ищем секцию "Ждут подтверждения"
-                let section = null;
-                root.querySelectorAll('h2, h3, [class*="Title"], [class*="Header"], div, span').forEach(el => {
-                    const text = (el.textContent || '').trim();
-                    if (text.includes('Ждут подтверждения') || text.includes('ждут подтверждения')) {
-                        section = el.closest('section, [class*="Section"], [class*="Block"], [class*="Container"]') || el.parentElement;
-                    }
-                });
-
-                // Из найденной секции (или всей страницы) извлекаем ссылки на заказы
-                const container = section || root;
-                container.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
-                    const match = a.href.match(/getoneorder\\/(\\d+)/);
-                    if (match && !ids.includes(match[1])) ids.push(match[1]);
-                });
-
-                // Fallback: если секции не нашли — ищем по тексту всей страницы
-                if (!section) {
-                    // Проверяем все карточки/элементы с текстом "Ждут подтверждения"
-                    const allText = root.innerText || '';
-                    if (allText.includes('Ждут подтверждения')) {
-                        root.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
-                            const match = a.href.match(/getoneorder\\/(\\d+)/);
-                            if (match && !ids.includes(match[1])) ids.push(match[1]);
-                        });
-                    }
-                }
-
-                return ids;
-            }
-        """)
+        # Извлекаем order_id из раздела «Активные» (активные чаты) на /home
+        pending_order_ids = await _retry_async(get_accepted_order_ids, page)
 
         if not pending_order_ids:
             return
 
-        await _log_action("accept", f"Найдено {len(pending_order_ids)} заказов в «Ждут подтверждения»")
+        await _log_action("accept", f"Найдено {len(pending_order_ids)} заказов в «Активные» на /home")
 
         for oid in pending_order_ids:
             if _shutting_down or not bot_running:
@@ -1071,12 +1187,25 @@ async def check_accepted_bids_job() -> None:
                 # Проверяем в БД — если bid_placed, значит заказчик принял нашу ставку
                 async with async_session() as session:
                     order = await get_order_by_avtor24_id(session, oid)
-                if not order or order.status != "bid_placed":
+
+                if not order:
+                    # Заказа нет в БД — парсим и создаём (ставку ставили вручную?)
+                    order = await _ensure_order_in_db(page, oid, status="accepted")
+                    if not order:
+                        continue
+                    # Только что создали со статусом accepted — статистику обновим ниже
+                elif order.status == "accepted":
+                    # Уже accepted — не переводим повторно
                     continue
+                elif order.status != "bid_placed":
+                    # Статус не bid_placed и не accepted — не трогаем
+                    continue
+                else:
+                    # bid_placed → accepted
+                    async with async_session() as session:
+                        await update_order_status(session, order.id, "accepted")
 
                 async with async_session() as session:
-                    await update_order_status(session, order.id, "accepted")
-
                     today = date.today()
                     stats = await get_daily_stats(session, today)
                     await upsert_daily_stats(

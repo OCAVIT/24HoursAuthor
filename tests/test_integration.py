@@ -1351,3 +1351,289 @@ class TestSeenOrderIdsDedup:
         assert len(main_mod._seen_order_ids) == 3
         assert "A1" in main_mod._seen_order_ids
         assert "A3" in main_mod._seen_order_ids
+
+
+# ===========================================================================
+# ТЕСТ 8: Обработка сообщений Ассистента (изменение условий)
+# ===========================================================================
+
+class TestAssistantMessageHandling:
+    """Тесты обработки сообщений Ассистента при изменении условий заказа."""
+
+    async def test_handle_assistant_updates_order_fields(self, int_engine, int_session):
+        """_handle_assistant_messages обновляет поля заказа в БД."""
+        from src.scraper.chat import ChatMessage
+        from src.scraper.order_detail import OrderDetail
+
+        # Создаём заказ в БД
+        order = await create_order(
+            int_session,
+            avtor24_id="60001",
+            title="Эссе по философии",
+            work_type="Эссе",
+            subject="Философия",
+            description="Старое описание",
+            pages_min=5,
+            pages_max=7,
+            budget_rub=1500,
+            status="accepted",
+            required_uniqueness=50,
+        )
+
+        # Мок сообщения Ассистента
+        assistant_msg = ChatMessage(
+            order_id="60001",
+            text="Условия заказа изменены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+        assert assistant_msg.is_assistant is True
+
+        # Мок fetch_order_detail — возвращает обновлённые условия
+        updated_detail = OrderDetail(
+            order_id="60001",
+            title="Эссе по философии",
+            url="https://avtor24.ru/order/getoneorder/60001",
+            work_type="Эссе",
+            subject="Философия",
+            description="Новое описание с доп требованиями",
+            pages_min=7,
+            pages_max=10,
+            budget_rub=2000,
+            required_uniqueness=70,
+            antiplagiat_system="ETXT",
+        )
+
+        mock_page = MagicMock()
+
+        factory = async_sessionmaker(
+            int_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=updated_detail), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock):
+
+            from src.main import _handle_assistant_messages
+            await _handle_assistant_messages(
+                mock_page, "60001", order, [assistant_msg],
+            )
+
+        # Перечитываем объект (expire_on_commit=False, но данные могли измениться в другой сессии)
+        int_session.expire_all()
+        updated_order = await get_order_by_avtor24_id(int_session, "60001")
+        assert updated_order.description == "Новое описание с доп требованиями"
+        assert updated_order.pages_min == 7
+        assert updated_order.pages_max == 10
+        assert updated_order.budget_rub == 2000
+        assert updated_order.required_uniqueness == 70
+        assert updated_order.antiplagiat_system == "ETXT"
+
+    async def test_handle_assistant_no_changes(self, int_engine, int_session):
+        """Если условия не изменились — ничего не обновляется."""
+        from src.scraper.chat import ChatMessage
+        from src.scraper.order_detail import OrderDetail
+
+        order = await create_order(
+            int_session,
+            avtor24_id="60002",
+            title="Реферат",
+            work_type="Реферат",
+            description="Описание",
+            pages_min=10,
+            pages_max=15,
+            budget_rub=1200,
+            status="accepted",
+            required_uniqueness=60,
+        )
+
+        assistant_msg = ChatMessage(
+            order_id="60002",
+            text="Уведомление",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+
+        # Мок fetch_order_detail — те же данные
+        same_detail = OrderDetail(
+            order_id="60002",
+            title="Реферат",
+            url="https://avtor24.ru/order/getoneorder/60002",
+            work_type="Реферат",
+            description="Описание",
+            pages_min=10,
+            pages_max=15,
+            budget_rub=1200,
+            required_uniqueness=60,
+        )
+
+        mock_page = MagicMock()
+
+        factory = async_sessionmaker(
+            int_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=same_detail), \
+             patch("src.main._log_action", new_callable=AsyncMock) as mock_log, \
+             patch("src.main.push_notification", new_callable=AsyncMock) as mock_notif:
+
+            from src.main import _handle_assistant_messages
+            await _handle_assistant_messages(
+                mock_page, "60002", order, [assistant_msg],
+            )
+
+        # push_notification НЕ вызван (условия не изменились)
+        mock_notif.assert_not_awaited()
+
+    async def test_handle_assistant_error_does_not_crash(self, int_session):
+        """Ошибка при обработке Ассистента не роняет бота."""
+        from src.scraper.chat import ChatMessage
+
+        order = await create_order(
+            int_session,
+            avtor24_id="60003",
+            title="Тест",
+            status="accepted",
+        )
+
+        assistant_msg = ChatMessage(
+            order_id="60003",
+            text="Ошибка",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+
+        mock_page = MagicMock()
+
+        with patch("src.main.async_session", side_effect=Exception("DB down")), \
+             patch("src.main._retry_async", new_callable=AsyncMock, side_effect=Exception("fetch fail")), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock):
+
+            from src.main import _handle_assistant_messages
+            # Не должен бросить исключение
+            await _handle_assistant_messages(
+                mock_page, "60003", order, [assistant_msg],
+            )
+
+    async def test_chat_responder_skips_assistant_reply(self, int_session):
+        """chat_responder_job не отвечает на сообщения Ассистента."""
+        from src.scraper.chat import ChatMessage
+
+        # Проверяем is_assistant property — если последнее сообщение от Ассистента,
+        # цикл делает continue и не генерирует ответ
+        msg = ChatMessage(
+            order_id="60004",
+            text="Условия заказа обновлены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+        assert msg.is_assistant is True
+        # В chat_responder_job: if last_msg.is_assistant: continue
+        # Это значит что ответ не будет отправлен
+
+
+class TestEnsureOrderInDb:
+    """Тесты _ensure_order_in_db — создание записей для активных заказов, не найденных в БД."""
+
+    async def test_returns_existing_order(self, int_engine, int_session):
+        """Если заказ уже в БД — возвращает его без парсинга."""
+        order = await create_order(
+            int_session,
+            avtor24_id="70001",
+            title="Существующий заказ",
+            status="accepted",
+        )
+
+        mock_page = MagicMock()
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock) as mock_retry, \
+             patch("src.main._log_action", new_callable=AsyncMock):
+
+            from src.main import _ensure_order_in_db
+            result = await _ensure_order_in_db(mock_page, "70001")
+
+        assert result is not None
+        assert result.avtor24_id == "70001"
+        # fetch_order_detail не вызывался — заказ уже в БД
+        mock_retry.assert_not_awaited()
+
+    async def test_creates_order_from_detail_page(self, int_engine, int_session):
+        """Если заказа нет в БД — парсит детальную страницу и создаёт запись."""
+        mock_page = MagicMock()
+        detail = OrderDetail(
+            order_id="70002",
+            title="Эссе: новый заказ",
+            url="https://avtor24.ru/order/getoneorder/70002",
+            work_type="Эссе",
+            subject="Философия",
+            description="Описание заказа",
+            pages_min=5,
+            pages_max=7,
+            budget_rub=1500,
+            customer_name="Иван",
+        )
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=detail), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.scraper.browser.browser_manager") as mock_bm:
+            mock_bm.random_delay = AsyncMock()
+
+            from src.main import _ensure_order_in_db
+            result = await _ensure_order_in_db(mock_page, "70002", status="accepted")
+
+        assert result is not None
+        assert result.avtor24_id == "70002"
+        assert result.title == "Эссе: новый заказ"
+        assert result.status == "accepted"
+        assert result.work_type == "Эссе"
+        assert result.budget_rub == 1500
+        assert result.customer_username == "Иван"
+
+        # Проверяем в БД
+        db_order = await get_order_by_avtor24_id(int_session, "70002")
+        assert db_order is not None
+        assert db_order.status == "accepted"
+
+    async def test_returns_none_on_parse_failure(self, int_engine):
+        """Если парсинг детальной страницы не удался — возвращает None."""
+        mock_page = MagicMock()
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=None), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.scraper.browser.browser_manager") as mock_bm:
+            mock_bm.random_delay = AsyncMock()
+
+            from src.main import _ensure_order_in_db
+            result = await _ensure_order_in_db(mock_page, "70003")
+
+        assert result is None
+
+    async def test_returns_none_on_exception(self, int_engine):
+        """При исключении в парсинге/создании — возвращает None, не падает."""
+        mock_page = MagicMock()
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, side_effect=Exception("Network error")), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.scraper.browser.browser_manager") as mock_bm:
+            mock_bm.random_delay = AsyncMock()
+
+            from src.main import _ensure_order_in_db
+            result = await _ensure_order_in_db(mock_page, "70004")
+
+        assert result is None

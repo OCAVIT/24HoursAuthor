@@ -13,7 +13,11 @@ from src.scraper.browser import BrowserManager, USER_AGENTS, VIEWPORTS, COOKIES_
 from src.scraper.orders import parse_order_cards, OrderSummary, _extract_number
 from src.scraper.order_detail import fetch_order_detail, OrderDetail, _extract_int, _extract_float
 from src.scraper.bidder import place_bid
-from src.scraper.chat import get_messages, send_message, ChatMessage
+from src.scraper.chat import (
+    get_messages, send_message, ChatMessage,
+    get_accepted_order_ids, get_active_chats,
+    _navigate_home, _extract_order_ids_from_section,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -715,6 +719,449 @@ class TestChat:
         result = await send_message(page, "10001", "Тест")
 
         assert result is False
+
+
+# ===== Тесты парсинга активных заказов с /home =====
+
+class TestActiveOrdersParsing:
+    """Тесты get_accepted_order_ids / get_active_chats — парсинг раздела «Активные» на /home."""
+
+    def _make_home_page(self, evaluate_result, url="https://avtor24.ru/home"):
+        """Создать мок страницы /home.
+
+        evaluate_result: list[dict] с полями {id, tag} — формат _extract_orders_with_tags.
+        """
+        page = MagicMock()
+        page.url = url
+        page.goto = AsyncMock()
+        page.evaluate = AsyncMock(return_value=evaluate_result)
+        return page
+
+    @staticmethod
+    def _ids(ids: list[str], tag: str = "") -> list[dict]:
+        """Хелпер: превратить список id в формат [{id, tag}] для мока evaluate."""
+        return [{"id": oid, "tag": tag} for oid in ids]
+
+    @pytest.mark.asyncio
+    async def test_get_accepted_order_ids_returns_ids(self):
+        """get_accepted_order_ids возвращает order_id из раздела «Активные»."""
+        page = self._make_home_page(self._ids(["12345", "67890"]))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == ["12345", "67890"]
+        page.goto.assert_awaited_once()
+        page.evaluate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_get_accepted_order_ids_empty(self):
+        """get_accepted_order_ids возвращает [] если нет активных заказов."""
+        page = self._make_home_page([])
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_accepted_order_ids_login_redirect(self):
+        """get_accepted_order_ids возвращает [] если редирект на логин."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/login"
+        page.goto = AsyncMock(side_effect=Exception("ERR_ABORTED"))
+        page.evaluate = AsyncMock(return_value=[])
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_accepted_order_ids_exception_returns_empty(self):
+        """get_accepted_order_ids возвращает [] при ошибке evaluate."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/home"
+        page.goto = AsyncMock()
+        page.evaluate = AsyncMock(side_effect=Exception("JS error"))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_active_chats_returns_ids(self):
+        """get_active_chats возвращает order_id из раздела «Активные»."""
+        page = self._make_home_page(self._ids(["11111", "22222", "33333"]))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_active_chats(page)
+
+        assert result == ["11111", "22222", "33333"]
+
+    @pytest.mark.asyncio
+    async def test_get_active_chats_empty(self):
+        """get_active_chats возвращает [] если нет чатов."""
+        page = self._make_home_page([])
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_active_chats(page)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_get_active_chats_login_redirect(self):
+        """get_active_chats возвращает [] при редиректе на логин."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/login"
+        page.goto = AsyncMock(side_effect=Exception("ERR_ABORTED"))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_active_chats(page)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_navigate_home_success(self):
+        """_navigate_home возвращает True при успешной навигации."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/home"
+        page.goto = AsyncMock()
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await _navigate_home(page)
+
+        assert result is True
+        page.goto.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_navigate_home_login_redirect(self):
+        """_navigate_home возвращает False при редиректе на /login."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/login"
+        page.goto = AsyncMock(side_effect=Exception("ERR_ABORTED"))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await _navigate_home(page)
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_navigate_home_non_abort_error_raises(self):
+        """_navigate_home пробрасывает не-ERR_ABORTED ошибки."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/home"
+        page.goto = AsyncMock(side_effect=Exception("Network timeout"))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            with pytest.raises(Exception, match="Network timeout"):
+                await _navigate_home(page)
+
+    @pytest.mark.asyncio
+    async def test_extract_order_ids_from_section_passes_keywords(self):
+        """_extract_order_ids_from_section передаёт ключевые слова в JS evaluate."""
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=[{"id": "55555", "tag": ""}])
+
+        result = await _extract_order_ids_from_section(
+            page, ["Активные", "активные"]
+        )
+
+        assert result == ["55555"]
+        # Проверяем что evaluate вызван с ключевыми словами
+        page.evaluate.assert_awaited_once()
+        call_args = page.evaluate.call_args
+        assert call_args[0][1] == ["Активные", "активные"]
+
+    @pytest.mark.asyncio
+    async def test_accepted_and_active_chats_use_same_keywords(self):
+        """get_accepted_order_ids и get_active_chats ищут 'Активные' (не 'Ждут подтверждения')."""
+        page = self._make_home_page(self._ids(["99999"]))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+
+            await get_accepted_order_ids(page)
+            call1_keywords = page.evaluate.call_args[0][1]
+
+            page.evaluate.reset_mock()
+            page.goto.reset_mock()
+
+            await get_active_chats(page)
+            call2_keywords = page.evaluate.call_args[0][1]
+
+        # Оба используют "Активные" keywords
+        assert "Активные" in call1_keywords
+        assert "Активные" in call2_keywords
+        # НЕ используют "Ждут подтверждения"
+        for kw in call1_keywords:
+            assert "Ждут подтверждения" not in kw
+        for kw in call2_keywords:
+            assert "Ждут подтверждения" not in kw
+
+    @pytest.mark.asyncio
+    async def test_get_accepted_multiple_orders_deduped(self):
+        """Дубликаты order_id не возвращаются (JS-уровень дедупликации)."""
+        page = self._make_home_page(self._ids(["11111", "22222"]))
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert len(result) == len(set(result))
+
+    # --- Тесты фильтрации по тегам статусов ---
+
+    @pytest.mark.asyncio
+    async def test_filters_out_completed_orders(self):
+        """Заказы с тегом 'завершен'/'завершён' не попадают в результат."""
+        items = [
+            {"id": "10001", "tag": ""},
+            {"id": "10002", "tag": "завершен"},
+            {"id": "10003", "tag": "Завершён"},
+            {"id": "10004", "tag": ""},
+        ]
+        page = self._make_home_page(items)
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == ["10001", "10004"]
+
+    @pytest.mark.asyncio
+    async def test_filters_out_waiting_confirmation(self):
+        """Заказы с тегом 'Ждёт подтверждения' не попадают в accepted."""
+        items = [
+            {"id": "20001", "tag": ""},
+            {"id": "20002", "tag": "Ждёт подтверждения"},
+            {"id": "20003", "tag": "ждет подтверждения"},
+        ]
+        page = self._make_home_page(items)
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == ["20001"]
+
+    @pytest.mark.asyncio
+    async def test_filters_out_cancelled_orders(self):
+        """Заказы с тегом 'отменен'/'отменён' не попадают в результат."""
+        items = [
+            {"id": "30001", "tag": "отменен"},
+            {"id": "30002", "tag": "Отменён"},
+            {"id": "30003", "tag": ""},
+        ]
+        page = self._make_home_page(items)
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == ["30003"]
+
+    @pytest.mark.asyncio
+    async def test_active_chats_also_filters_by_tags(self):
+        """get_active_chats тоже фильтрует по тегам."""
+        items = [
+            {"id": "40001", "tag": ""},
+            {"id": "40002", "tag": "завершен"},
+            {"id": "40003", "tag": "Ждёт подтверждения"},
+            {"id": "40004", "tag": ""},
+        ]
+        page = self._make_home_page(items)
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_active_chats(page)
+
+        assert result == ["40001", "40004"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_tags_comprehensive(self):
+        """Комплексный тест: разные теги фильтруются корректно."""
+        items = [
+            {"id": "50001", "tag": ""},                         # в работе ✓
+            {"id": "50002", "tag": "завершен"},                 # ✗
+            {"id": "50003", "tag": "Ждёт подтверждения"},       # ✗
+            {"id": "50004", "tag": "отменен"},                  # ✗
+            {"id": "50005", "tag": "В работе"},                 # неизвестный тег = в работе ✓
+            {"id": "50006", "tag": ""},                         # в работе ✓
+        ]
+        page = self._make_home_page(items)
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == ["50001", "50005", "50006"]
+
+    @pytest.mark.asyncio
+    async def test_all_orders_filtered_returns_empty(self):
+        """Если все заказы завершены/ожидают — пустой список."""
+        items = [
+            {"id": "60001", "tag": "завершен"},
+            {"id": "60002", "tag": "Ждёт подтверждения"},
+        ]
+        page = self._make_home_page(items)
+
+        with patch("src.scraper.chat.settings") as mock_settings:
+            mock_settings.avtor24_base_url = "https://avtor24.ru"
+            result = await get_accepted_order_ids(page)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_extract_orders_with_tags_returns_tuples(self):
+        """_extract_orders_with_tags возвращает список кортежей (id, tag)."""
+        from src.scraper.chat import _extract_orders_with_tags
+
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=[
+            {"id": "70001", "tag": "завершен"},
+            {"id": "70002", "tag": ""},
+        ])
+
+        result = await _extract_orders_with_tags(page, ["Активные"])
+        assert result == [("70001", "завершен"), ("70002", "")]
+
+
+# ===== Тесты ChatMessage.is_assistant =====
+
+class TestChatMessageAssistant:
+    """Тесты определения сообщений от Ассистента."""
+
+    def test_is_assistant_by_sender_name(self):
+        """Сообщение от 'Ассистент' определяется как assistant."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Условия заказа изменены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+        assert msg.is_assistant is True
+
+    def test_is_assistant_case_insensitive(self):
+        """is_assistant нечувствителен к регистру."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Какой-то текст",
+            is_incoming=True,
+            sender_name="ассистент",
+        )
+        assert msg.is_assistant is True
+
+    def test_is_assistant_by_system_text(self):
+        """Системное сообщение с 'ассистент' в тексте = assistant."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Ассистент: условия заказа были изменены заказчиком",
+            is_incoming=False,
+            is_system=True,
+        )
+        assert msg.is_assistant is True
+
+    def test_not_assistant_regular_customer(self):
+        """Обычное сообщение от заказчика — не assistant."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Когда будет готово?",
+            is_incoming=True,
+            sender_name="Иван",
+        )
+        assert msg.is_assistant is False
+
+    def test_not_assistant_our_message(self):
+        """Наше исходящее сообщение — не assistant."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Работа готова",
+            is_incoming=False,
+        )
+        assert msg.is_assistant is False
+
+    def test_not_assistant_no_sender(self):
+        """Сообщение без sender_name — не assistant."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Привет",
+            is_incoming=True,
+        )
+        assert msg.is_assistant is False
+
+    def test_is_assistant_with_prefix(self):
+        """Sender 'Ассистент Автор24' тоже определяется."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Текст",
+            is_incoming=True,
+            sender_name="Ассистент Автор24",
+        )
+        assert msg.is_assistant is True
+
+    def test_get_messages_includes_sender_name(self):
+        """get_messages сохраняет sender_name из JS evaluate."""
+        msg = ChatMessage(
+            order_id="123",
+            text="Текст",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+        assert msg.sender_name == "Ассистент"
+        assert msg.is_assistant is True
+
+    @pytest.mark.asyncio
+    async def test_get_messages_parses_sender_name(self):
+        """get_messages передаёт senderName из JS evaluate в ChatMessage."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/order/getoneorder/10001"
+        page.goto = AsyncMock()
+
+        js_result = [
+            {
+                "text": "Условия заказа изменены",
+                "isSystem": False,
+                "isOutgoing": False,
+                "timestamp": "12:00",
+                "senderName": "Ассистент",
+                "hasFiles": False,
+                "fileUrls": [],
+            },
+            {
+                "text": "Когда будет готово?",
+                "isSystem": False,
+                "isOutgoing": False,
+                "timestamp": "12:05",
+                "senderName": "Иван",
+                "hasFiles": False,
+                "fileUrls": [],
+            },
+        ]
+        page.evaluate = AsyncMock(return_value=js_result)
+
+        chat_tab = MagicMock()
+        chat_tab.count = AsyncMock(return_value=0)
+        page.locator = MagicMock(return_value=chat_tab)
+
+        messages = await get_messages(page, "10001")
+
+        assert len(messages) == 2
+        assert messages[0].sender_name == "Ассистент"
+        assert messages[0].is_assistant is True
+        assert messages[1].sender_name == "Иван"
+        assert messages[1].is_assistant is False
 
 
 # ===== Тесты утилит =====
