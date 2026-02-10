@@ -1006,7 +1006,8 @@ async def _handle_assistant_messages(
         if update_kwargs.pop("_description_changed", False):
             try:
                 from src.scraper.order_detail import fetch_order_detail
-                detail = await fetch_order_detail(page, avtor24_id)
+                detail_url = f"/order/getoneorder/{avtor24_id}"
+                detail = await fetch_order_detail(page, detail_url)
                 if detail and detail.description:
                     update_kwargs["description"] = detail.description
                     logger.info("Описание перечитано со страницы для %s", avtor24_id)

@@ -560,10 +560,9 @@ async def extract_order_changes(
 
     if changes and not (len(changes) == 1 and "_description_changed" in changes):
         # Regex нашёл конкретные изменения — GPT не нужен
-        changes.pop("_description_changed", None)
         logger.info(
             "Regex извлёк изменения из сообщения Ассистента: %s",
-            changes,
+            {k: v for k, v in changes.items() if not k.startswith("_")},
         )
         return changes
 
