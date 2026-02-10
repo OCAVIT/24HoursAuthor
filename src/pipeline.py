@@ -60,10 +60,14 @@ async def analyze_and_bid(
         result.error = "Заказ уже обработан"
         return result
 
-    # Gate: пропускаем заказы с .rar файлами
-    rar_files = [f for f in (order.file_names or []) if f.lower().endswith(".rar")]
-    if rar_files:
-        logger.info("Пропуск заказа %s: содержит .rar файлы: %s", order.order_id, rar_files)
+    # Gate: пропускаем заказы с архивами (не можем распаковать/анализировать)
+    _ARCHIVE_EXTS = {".rar", ".zip", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tar.gz", ".tgz"}
+    archive_files = [
+        f for f in (order.file_names or [])
+        if any(f.lower().endswith(ext) for ext in _ARCHIVE_EXTS)
+    ]
+    if archive_files:
+        logger.info("Пропуск заказа %s: содержит архивы: %s", order.order_id, archive_files)
         db_order = await create_order(
             session,
             avtor24_id=order.order_id,
@@ -77,7 +81,7 @@ async def analyze_and_bid(
         )
         result.db_order_id = db_order.id
         result.status = "rejected"
-        result.error = f"Пропущен: .rar файлы ({', '.join(rar_files)})"
+        result.error = f"Пропущен: архивы ({', '.join(archive_files)})"
         return result
 
     # Скоринг
