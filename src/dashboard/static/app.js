@@ -127,9 +127,24 @@ function dashboard() {
            NAVIGATION
            ================================================== */
         navigate(page) {
+            /* Destroy charts on the page we're leaving — Chart.js ResizeObserver
+               breaks when x-show sets display:none on the container */
+            this._destroyPageCharts(this.currentPage);
+
             this.currentPage = page;
             window.location.hash = page;
             this.loadPageData();
+        },
+
+        _destroyPageCharts(page) {
+            if (page === 'overview') {
+                if (this._incomeChart)  { this._incomeChart.destroy();  this._incomeChart = null; }
+                if (this._ordersChart)  { this._ordersChart.destroy();  this._ordersChart = null; }
+            }
+            if (page === 'analytics') {
+                if (this._analyticsIncomeChart) { this._analyticsIncomeChart.destroy(); this._analyticsIncomeChart = null; }
+                if (this._analyticsApiChart)    { this._analyticsApiChart.destroy();    this._analyticsApiChart = null; }
+            }
         },
 
         get pageTitle() {
@@ -209,7 +224,9 @@ function dashboard() {
             const incomes = daily.map(d => d.income_rub || 0);
             const delivered = daily.map(d => d.orders_delivered || 0);
 
-            this.$nextTick(() => {
+            /* setTimeout instead of $nextTick — gives browser time to finish
+               x-show transition and calculate container dimensions */
+            setTimeout(() => {
                 this.renderChart('incomeChart', '_incomeChart', 'bar', labels, [{
                     label: 'Доход (руб)', data: incomes,
                     backgroundColor: 'rgba(124,58,237,0.5)', borderColor: '#7c3aed',
@@ -220,7 +237,7 @@ function dashboard() {
                     borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)',
                     fill: true, tension: 0.3, pointRadius: 2,
                 }]);
-            });
+            }, 100);
         },
 
         /* ==================================================
@@ -278,7 +295,7 @@ function dashboard() {
             const labels = daily.map(d => d.date ? d.date.slice(5) : '');
             const incomes = daily.map(d => d.income_rub || 0);
 
-            this.$nextTick(() => {
+            setTimeout(() => {
                 this.renderChart('analyticsIncomeChart', '_analyticsIncomeChart', 'bar', labels, [{
                     label: 'Доход (руб)', data: incomes,
                     backgroundColor: 'rgba(124,58,237,0.5)', borderColor: '#7c3aed',
@@ -295,7 +312,7 @@ function dashboard() {
                     backgroundColor: colors.slice(0, modelLabels.length),
                     borderWidth: 0,
                 }], { cutout: '65%' });
-            });
+            }, 100);
         },
 
         /* ==================================================
@@ -488,26 +505,30 @@ function dashboard() {
            ================================================== */
         renderChart(canvasId, storeKey, type, labels, datasets, extraOpts = {}) {
             const canvas = document.getElementById(canvasId);
-            if (!canvas || canvas.offsetParent === null) return;
-            if (this[storeKey]) this[storeKey].destroy();
+            if (!canvas) return;
+            if (this[storeKey]) { this[storeKey].destroy(); this[storeKey] = null; }
 
-            const isDoughnut = type === 'doughnut' || type === 'pie';
-            this[storeKey] = new Chart(canvas, {
-                type,
-                data: { labels, datasets },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: { display: isDoughnut, position: 'bottom', labels: { color: '#a1a1aa', padding: 16, font: { size: 11 } } },
+            try {
+                const isDoughnut = type === 'doughnut' || type === 'pie';
+                this[storeKey] = new Chart(canvas, {
+                    type,
+                    data: { labels, datasets },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: { display: isDoughnut, position: 'bottom', labels: { color: '#a1a1aa', padding: 16, font: { size: 11 } } },
+                        },
+                        scales: isDoughnut ? {} : {
+                            x: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#71717a', font: { size: 10 } } },
+                            y: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#71717a', font: { size: 10 } }, beginAtZero: true },
+                        },
+                        ...extraOpts,
                     },
-                    scales: isDoughnut ? {} : {
-                        x: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#71717a', font: { size: 10 } } },
-                        y: { grid: { color: 'rgba(255,255,255,0.03)' }, ticks: { color: '#71717a', font: { size: 10 } }, beginAtZero: true },
-                    },
-                    ...extraOpts,
-                },
-            });
+                });
+            } catch (e) {
+                console.warn('Chart render error:', canvasId, e);
+            }
         },
 
         /* ==================================================
