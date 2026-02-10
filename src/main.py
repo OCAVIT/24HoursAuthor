@@ -951,11 +951,11 @@ async def _handle_assistant_messages(
     order,
     assistant_msgs: list,
 ) -> None:
-    """Обработать сообщения Ассистента: извлечь изменения через GPT-4o-mini.
+    """Обработать сообщения Ассистента: извлечь изменения (regex + GPT fallback).
 
     Ассистент на Автор24 отправляет сообщения об изменении условий заказа.
-    GPT-4o-mini парсит текст сообщения и извлекает конкретные изменения.
-    Если условия неприемлемые — можно отменить заказ (кнопка "Отменить").
+    Regex парсит формат "было 'X' стало 'Y'" (быстро, бесплатно).
+    GPT-4o-mini как fallback для нестандартных сообщений.
     """
     from src.scraper.browser import browser_manager
     from src.scraper.chat import cancel_order
@@ -966,14 +966,18 @@ async def _handle_assistant_messages(
     try:
         await _log_action(
             "chat",
-            f"Обнаружено {len(assistant_msgs)} сообщений Ассистента, GPT-извлечение изменений",
+            f"Обнаружено {len(assistant_msgs)} сообщений Ассистента, извлечение изменений",
             order_id=order.id,
         )
 
         # Собираем текст всех сообщений ассистента
         combined_text = "\n".join(m.text for m in assistant_msgs)
+        logger.info(
+            "Текст сообщения Ассистента для %s: %s",
+            avtor24_id, combined_text[:500],
+        )
 
-        # Текущее состояние заказа для контекста GPT
+        # Текущее состояние заказа для контекста (fallback GPT)
         current_order = {
             "title": order.title,
             "work_type": order.work_type,
@@ -984,17 +988,30 @@ async def _handle_assistant_messages(
             "budget_rub": order.budget_rub,
         }
 
-        # GPT-4o-mini извлекает изменения из текста сообщения
+        # Извлекаем изменения (regex-first, GPT fallback)
         update_kwargs = await extract_order_changes(combined_text, current_order)
 
-        # Убираем поля, где значение не изменилось
-        unchanged = []
-        for k, v in list(update_kwargs.items()):
-            current = getattr(order, k, None)
-            if current is not None and str(current) == str(v):
-                unchanged.append(k)
-        for k in unchanged:
-            del update_kwargs[k]
+        # Логируем все извлечённые изменения
+        logger.info(
+            "Извлечённые изменения для %s: %s",
+            avtor24_id, update_kwargs or "(пусто)",
+        )
+
+        # НЕ фильтруем по текущим значениям в БД — сообщение Ассистента
+        # содержит "стало 'Y'" и мы должны записать Y в БД, даже если
+        # предыдущий цикл уже записал это значение (dedup кеш защитит
+        # от повторной обработки того же сообщения).
+
+        # Если описание изменилось — перечитаем со страницы
+        if update_kwargs.pop("_description_changed", False):
+            try:
+                from src.scraper.order_detail import fetch_order_detail
+                detail = await fetch_order_detail(page, avtor24_id)
+                if detail and detail.description:
+                    update_kwargs["description"] = detail.description
+                    logger.info("Описание перечитано со страницы для %s", avtor24_id)
+            except Exception as e:
+                logger.warning("Не удалось перечитать описание для %s: %s", avtor24_id, e)
 
         if update_kwargs:
             async with async_session() as session:

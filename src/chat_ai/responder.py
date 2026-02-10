@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -458,17 +459,92 @@ async def detect_customer_approval(
     }
 
 
+def _parse_assistant_regex(text: str) -> dict:
+    """Парсить сообщение Ассистента регулярками.
+
+    Формат сообщений Автор24:
+    "Заказчик изменил в заказе: Изменилась тема: было 'X' стало 'Y',
+     Бюджет: было '0' стало '5000', Предмет: было 'Другое' стало 'Педагогика', ..."
+
+    Также обрабатывает "Изменилось описание" (без было/стало).
+    """
+    # Убираем timestamp в конце (HH:MM на отдельной строке или в конце)
+    text = re.sub(r'\n?\d{1,2}:\d{2}\s*$', '', text.strip())
+
+    changes: dict = {}
+
+    # Маппинг ключевых слов из сообщения → поле в БД
+    field_map = {
+        "тема": "title",
+        "тип работы": "work_type",
+        "предмет": "subject",
+        "бюджет": "budget_rub",
+        "уникальность": "required_uniqueness",
+        "количество страниц от": "pages_min",
+        "количество страниц до": "pages_max",
+        "размер шрифта": "font_size",
+        "межстрочный интервал": "line_spacing",
+        "дедлайн": "deadline",
+        "срок сдачи": "deadline",
+        "антиплагиат": "antiplagiat_system",
+    }
+
+    # Паттерн: "FIELD: было 'OLD' стало 'NEW'"
+    # Также: "Изменилась FIELD: было 'OLD' стало 'NEW'"
+    pattern = re.compile(
+        r"(?:Изменил(?:ся|ась|ось)\s+)?"
+        r"([^:,]+?):\s*было\s+'([^']*)'\s*стало\s+'([^']*)'",
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        label = match.group(1).strip().lower()
+        new_value = match.group(3).strip()
+
+        for keyword, db_field in field_map.items():
+            if keyword in label:
+                changes[db_field] = new_value
+                break
+
+    # Обработка "Изменилось описание" (без было/стало, только факт изменения)
+    if re.search(r'Изменилось\s+описание', text, re.IGNORECASE):
+        changes["_description_changed"] = True
+
+    return changes
+
+
+# Типы полей для валидации
+_FIELD_TYPES = {
+    "title": str, "work_type": str, "subject": str, "description": str,
+    "antiplagiat_system": str, "deadline": str,
+    "pages_min": int, "pages_max": int, "required_uniqueness": int,
+    "budget_rub": int, "font_size": int,
+    "line_spacing": float,
+}
+
+
+def _validate_changes(raw: dict) -> dict:
+    """Валидировать и привести типы извлечённых изменений."""
+    changes = {}
+    for field, expected_type in _FIELD_TYPES.items():
+        if field in raw and raw[field] is not None:
+            try:
+                changes[field] = expected_type(raw[field])
+            except (ValueError, TypeError):
+                pass
+    # Прокинуть флаг описания
+    if raw.get("_description_changed"):
+        changes["_description_changed"] = True
+    return changes
+
+
 async def extract_order_changes(
     assistant_message_text: str,
     current_order: dict,
 ) -> dict:
-    """Извлечь изменения заказа из текста сообщения Ассистента через GPT-4o-mini.
+    """Извлечь изменения заказа из текста сообщения Ассистента.
 
-    На Автор24 платформа присылает уведомления вида:
-    "Заказчик изменил в заказе: тема — Новая тема"
-    "Заказчик изменил в заказе: кол-во страниц — 25"
-
-    GPT парсит текст и возвращает структурированные изменения.
+    Сначала пробуем regex-парсинг (быстро, бесплатно, надёжно).
+    Если regex не нашёл ничего — fallback на GPT-4o-mini.
 
     Args:
         assistant_message_text: Текст сообщения Ассистента.
@@ -476,30 +552,44 @@ async def extract_order_changes(
 
     Returns:
         Словарь изменённых полей: {"title": "...", "pages_min": 25, ...}
-        Только поля с реальными изменениями. Пустой dict если ничего не извлечено.
+        Пустой dict если ничего не извлечено.
     """
+    # === Шаг 1: Regex-парсинг ===
+    raw = _parse_assistant_regex(assistant_message_text)
+    changes = _validate_changes(raw)
+
+    if changes and not (len(changes) == 1 and "_description_changed" in changes):
+        # Regex нашёл конкретные изменения — GPT не нужен
+        changes.pop("_description_changed", None)
+        logger.info(
+            "Regex извлёк изменения из сообщения Ассистента: %s",
+            changes,
+        )
+        return changes
+
+    # === Шаг 2: Fallback — GPT-4o-mini ===
+    logger.info("Regex не нашёл конкретных изменений, используем GPT-4o-mini")
     prompt_messages = [
         {
             "role": "system",
             "content": (
                 "Ты парсишь уведомление платформы Автор24 об изменении условий заказа. "
-                "Извлеки из текста какие именно поля заказа изменились и их новые значения.\n\n"
+                "Извлеки из текста какие именно поля заказа изменились и их НОВЫЕ значения.\n\n"
+                "Формат сообщений: 'Заказчик изменил в заказе: ПОЛЕ: было 'X' стало 'Y', ...'\n\n"
                 "Возможные поля:\n"
                 "- title (string): тема/название работы\n"
                 "- work_type (string): тип работы (Курсовая работа, Реферат, Эссе и т.д.)\n"
                 "- subject (string): предмет (Экономика, Менеджмент и т.д.)\n"
-                "- description (string): описание/ТЗ заказа\n"
+                "- description (string): описание/ТЗ заказа (если 'Изменилось описание')\n"
                 "- pages_min (int): мин. количество страниц\n"
                 "- pages_max (int): макс. количество страниц\n"
                 "- required_uniqueness (int): требуемая уникальность в %\n"
-                "- antiplagiat_system (string): система антиплагиата\n"
-                "- deadline (string): дедлайн (дата в формате YYYY-MM-DD)\n"
                 "- budget_rub (int): бюджет в рублях\n"
                 "- font_size (int): размер шрифта\n"
                 "- line_spacing (float): межстрочный интервал\n\n"
                 "Верни JSON с ТОЛЬКО изменёнными полями и их НОВЫМИ значениями.\n"
-                "Пример: {\"title\": \"Новая тема работы\", \"pages_max\": 30}\n"
-                "Если не удалось извлечь конкретные изменения — верни пустой объект: {}"
+                "Пример: {\"title\": \"Новая тема работы\", \"pages_max\": 30, \"budget_rub\": 5000}\n"
+                "Если не удалось извлечь — верни пустой объект: {}"
             ),
         },
         {
@@ -532,29 +622,16 @@ async def extract_order_changes(
         except (json.JSONDecodeError, TypeError):
             parsed = {}
 
-    # Валидация: оставляем только известные поля с корректными типами
-    valid_fields = {
-        "title": str, "work_type": str, "subject": str, "description": str,
-        "antiplagiat_system": str, "deadline": str,
-        "pages_min": int, "pages_max": int, "required_uniqueness": int,
-        "budget_rub": int, "font_size": int,
-        "line_spacing": float,
-    }
-    changes = {}
-    for field, expected_type in valid_fields.items():
-        if field in parsed and parsed[field] is not None:
-            try:
-                changes[field] = expected_type(parsed[field])
-            except (ValueError, TypeError):
-                pass  # Пропускаем невалидные значения
+    gpt_changes = _validate_changes(parsed)
+    gpt_changes.pop("_description_changed", None)
 
     logger.info(
         "GPT извлёк изменения из сообщения Ассистента: %s, %d токенов, $%.4f",
-        changes or "(пусто)",
+        gpt_changes or "(пусто)",
         result.get("total_tokens", 0), result.get("cost_usd", 0),
     )
 
-    return changes
+    return gpt_changes
 
 
 def _build_context(
