@@ -1083,16 +1083,30 @@ async def chat_responder_job() -> None:
                     continue
 
                 # --- Обработка сообщений Ассистента (изменение условий заказа) ---
+                # Пропускаем при первом контакте с чатом: старые сообщения Ассистента
+                # уже учтены при парсинге деталей заказа. Обрабатываем только если
+                # у нас уже есть исходящие сообщения (= мы уже вели этот чат).
                 assistant_msgs = [m for m in chat_messages if m.is_assistant]
                 if assistant_msgs:
-                    await _handle_assistant_messages(
-                        page, avtor24_id, order, assistant_msgs,
-                    )
-                    # Перечитываем заказ из БД (мог обновиться)
                     async with async_session() as session:
-                        order = await get_order_by_avtor24_id(session, avtor24_id)
-                    if not order:
-                        continue
+                        db_msgs = await get_messages_for_order(session, order.id)
+                    has_outgoing = any(m.direction == "outgoing" for m in db_msgs)
+                    if has_outgoing:
+                        await _handle_assistant_messages(
+                            page, avtor24_id, order, assistant_msgs,
+                        )
+                        # Перечитываем заказ из БД (мог обновиться)
+                        async with async_session() as session:
+                            order = await get_order_by_avtor24_id(session, avtor24_id)
+                        if not order:
+                            continue
+                    else:
+                        await _log_action(
+                            "chat",
+                            f"Пропущены {len(assistant_msgs)} сообщений Ассистента "
+                            f"по заказу #{avtor24_id} (первый контакт, условия уже в БД)",
+                            order_id=order.id,
+                        )
 
                 # Последнее сообщение — от заказчика?
                 last_msg = chat_messages[-1]

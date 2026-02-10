@@ -2250,3 +2250,152 @@ class TestWaitingConfirmation:
             for call in mock_log.call_args_list
         )
         assert error_logged
+
+
+class TestAssistantMessageGuard:
+    """Тесты guard: пропуск старых сообщений Ассистента при первом контакте."""
+
+    @pytest.mark.asyncio
+    async def test_skips_assistant_on_first_contact(self, int_engine, int_session):
+        """Не обрабатывает сообщения Ассистента, если нет исходящих (первый контакт)."""
+        from src.scraper.chat import ChatMessage
+
+        # Заказ принят, но мы ещё ничего не писали (нет outgoing сообщений)
+        order = await create_order(
+            int_session,
+            avtor24_id="96001",
+            title="Первый контакт",
+            work_type="Эссе",
+            bid_price=1500,
+            status="accepted",
+        )
+
+        assistant_msg = ChatMessage(
+            order_id="96001",
+            text="Условия заказа установлены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+        # Последнее сообщение — наше (системное/outgoing в чате но НЕ в БД)
+        our_msg = ChatMessage(
+            order_id="96001",
+            text="Здравствуйте, приступаю к работе",
+            is_incoming=False,
+        )
+
+        mock_page = MagicMock()
+        mock_page.url = "https://avtor24.ru/home"
+        mock_page.goto = AsyncMock()
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def _retry_passthrough(fn, *a, **kw):
+            return await fn(*a, **kw)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", side_effect=_retry_passthrough), \
+             patch("src.main._log_action", new_callable=AsyncMock) as mock_log, \
+             patch("src.main._track_task", new_callable=AsyncMock), \
+             patch("src.main._untrack_task", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock), \
+             patch("src.main.is_banned", return_value=False), \
+             patch("src.main.bot_running", True), \
+             patch("src.main._shutting_down", False), \
+             patch("src.scraper.chat.get_active_chats", new_callable=AsyncMock, return_value=["96001"]), \
+             patch("src.scraper.chat.get_messages", new_callable=AsyncMock, return_value=[assistant_msg, our_msg]), \
+             patch("src.scraper.chat.send_message", new_callable=AsyncMock, return_value=True), \
+             patch("src.scraper.auth.login", new_callable=AsyncMock, return_value=mock_page), \
+             patch("src.scraper.browser.browser_manager") as mock_bm, \
+             patch("src.main._handle_assistant_messages", new_callable=AsyncMock) as mock_handle:
+
+            mock_bm.page_lock = MagicMock()
+            mock_bm.page_lock.acquire = AsyncMock()
+            mock_bm.page_lock.release = MagicMock()
+            mock_bm.random_delay = AsyncMock()
+
+            from src.main import chat_responder_job
+            await chat_responder_job()
+
+        # _handle_assistant_messages НЕ вызван (нет outgoing в БД = первый контакт)
+        mock_handle.assert_not_awaited()
+
+        # Но залогировано что пропустили
+        skipped = any(
+            "первый контакт" in str(call)
+            for call in mock_log.call_args_list
+        )
+        assert skipped
+
+    @pytest.mark.asyncio
+    async def test_processes_assistant_after_first_contact(self, int_engine, int_session):
+        """Обрабатывает сообщения Ассистента, если есть исходящие (уже общались)."""
+        from src.scraper.chat import ChatMessage
+
+        order = await create_order(
+            int_session,
+            avtor24_id="96002",
+            title="Повторный контакт",
+            work_type="Эссе",
+            bid_price=1500,
+            status="accepted",
+        )
+
+        # У нас уже есть исходящее сообщение в БД
+        await create_message(int_session, order_id=order.id, direction="outgoing", text="Привет!")
+
+        assistant_msg = ChatMessage(
+            order_id="96002",
+            text="Условия изменены Ассистентом",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+        customer_msg = ChatMessage(
+            order_id="96002",
+            text="Когда будет готово?",
+            is_incoming=True,
+        )
+
+        mock_page = MagicMock()
+        mock_page.url = "https://avtor24.ru/home"
+        mock_page.goto = AsyncMock()
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        async def _retry_passthrough(fn, *a, **kw):
+            return await fn(*a, **kw)
+
+        mock_response = MagicMock()
+        mock_response.text = "Скоро будет готово!"
+        mock_response.input_tokens = 50
+        mock_response.output_tokens = 20
+        mock_response.total_tokens = 70
+        mock_response.cost_usd = 0.001
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", side_effect=_retry_passthrough), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main._track_task", new_callable=AsyncMock), \
+             patch("src.main._untrack_task", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock), \
+             patch("src.main.is_banned", return_value=False), \
+             patch("src.main.bot_running", True), \
+             patch("src.main._shutting_down", False), \
+             patch("src.scraper.chat.get_active_chats", new_callable=AsyncMock, return_value=["96002"]), \
+             patch("src.scraper.chat.get_messages", new_callable=AsyncMock, return_value=[assistant_msg, customer_msg]), \
+             patch("src.scraper.chat.send_message", new_callable=AsyncMock, return_value=True), \
+             patch("src.scraper.auth.login", new_callable=AsyncMock, return_value=mock_page), \
+             patch("src.scraper.browser.browser_manager") as mock_bm, \
+             patch("src.main._handle_assistant_messages", new_callable=AsyncMock) as mock_handle, \
+             patch("src.chat_ai.responder.generate_response", new_callable=AsyncMock, return_value=mock_response), \
+             patch("src.database.crud.update_order_fields", new_callable=AsyncMock):
+
+            mock_bm.page_lock = MagicMock()
+            mock_bm.page_lock.acquire = AsyncMock()
+            mock_bm.page_lock.release = MagicMock()
+            mock_bm.random_delay = AsyncMock()
+
+            from src.main import chat_responder_job
+            await chat_responder_job()
+
+        # _handle_assistant_messages ВЫЗВАН (есть outgoing в БД = уже общались)
+        mock_handle.assert_awaited_once()
