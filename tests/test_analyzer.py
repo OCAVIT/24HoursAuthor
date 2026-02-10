@@ -12,6 +12,8 @@ from src.analyzer.order_scorer import score_order, ScoreResult, _build_order_pro
 from src.analyzer.price_calculator import (
     calculate_price, _try_budget_based, _try_average_bid_based,
     _formula_based, _default_pages, _complexity_factor, MIN_BID,
+    estimate_income, estimate_api_cost, is_profitable, min_profitable_bid,
+    AUTHOR_COMMISSION_RATE,
 )
 from src.analyzer.file_analyzer import extract_text, extract_text_from_pdf, extract_text_from_docx
 
@@ -164,17 +166,25 @@ class TestPriceCalculator:
 
     def test_budget_based_pricing(self):
         """Цена на основе бюджета заказчика: 85-95% от бюджета."""
-        order = _make_order(budget="3000₽", budget_rub=3000)
+        order = _make_order(budget="3000₽", budget_rub=3000, average_bid=None)
         for _ in range(20):
             price = calculate_price(order)
             assert 2550 <= price <= 2850  # 85-95% от 3000
+
+    def test_combined_budget_and_avg_pricing(self):
+        """Если есть и бюджет и средняя ставка — взвешенное среднее."""
+        order = _make_order(budget="3000₽", budget_rub=3000, average_bid=2000)
+        for _ in range(20):
+            price = calculate_price(order)
+            # blended = 3000*0.6 + 2000*0.4 = 2600, then 85-95% = 2210-2470
+            assert 2200 <= price <= 2500
 
     def test_average_bid_based_pricing(self):
         """Если нет бюджета — используем среднюю ставку."""
         order = _make_order(budget=None, budget_rub=None, average_bid=2000)
         for _ in range(20):
             price = calculate_price(order)
-            assert 1800 <= price <= 2000  # 90-100% от 2000
+            assert 1700 <= price <= 1960  # 85-98% от 2000
 
     def test_formula_based_pricing(self):
         """Если нет ни бюджета ни ставок — формула."""
@@ -243,6 +253,52 @@ class TestPriceCalculator:
         """Без средней ставки → None."""
         order = _make_order(average_bid=None)
         assert _try_average_bid_based(order) is None
+
+    def test_estimate_income(self):
+        """Доход = ставка * 97.5%."""
+        assert estimate_income(1000) == 975
+        assert estimate_income(500) == 487
+        assert estimate_income(5000) == 4875
+
+    def test_commission_rate_is_correct(self):
+        """Комиссия платформы 2.5% (verified Feb 2026)."""
+        assert AUTHOR_COMMISSION_RATE == 0.975
+
+    def test_estimate_api_cost(self):
+        """Оценка стоимости API для разных типов работ."""
+        assert estimate_api_cost("Эссе") == 12
+        assert estimate_api_cost("Курсовая работа") == 90
+        assert estimate_api_cost("Дипломная работа") == 220
+        assert estimate_api_cost("Неизвестный тип") == 30  # дефолт
+
+    def test_is_profitable_yes(self):
+        """Прибыльный заказ: доход >= api_cost * 3."""
+        # Эссе: API cost=12, нужен доход >= 36, ставка >= 37
+        assert is_profitable(300, "Эссе") is True  # 292₽ >> 36₽
+
+    def test_is_profitable_no(self):
+        """Убыточный заказ: доход < api_cost * 3."""
+        # Дипломная: API cost=220, нужен доход >= 660, ставка >= 677
+        assert is_profitable(300, "Дипломная работа") is False  # 292₽ < 660₽
+
+    def test_min_profitable_bid(self):
+        """Минимальная прибыльная ставка."""
+        # Эссе: api_cost=12, need bid >= 12*3/0.975 = 36.9 → 37
+        bid = min_profitable_bid("Эссе")
+        assert bid >= MIN_BID  # always at least MIN_BID
+        # Дипломная: api_cost=220, need bid >= 220*3/0.975 = 677
+        bid = min_profitable_bid("Дипломная работа")
+        assert bid >= 677
+
+    def test_profitability_floor_in_calculate_price(self):
+        """calculate_price поднимает цену до min_profitable_bid."""
+        # Дипломная с очень низким бюджетом → должна подняться до прибыльного уровня
+        order = _make_order(
+            budget="400₽", budget_rub=400, average_bid=None,
+            work_type="Дипломная работа",
+        )
+        price = calculate_price(order)
+        assert price >= min_profitable_bid("Дипломная работа")
 
 
 # ===== Тесты анализа файлов =====
