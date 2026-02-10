@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 CHARS_PER_PAGE = 1800
 WORDS_PER_PAGE = 250
-MAX_EXPAND_ITERATIONS = 5
+MAX_EXPAND_ITERATIONS = 12
 
 
 @dataclass
@@ -74,6 +74,11 @@ def _is_conclusion(section: SectionPlan) -> bool:
     return "заключени" in section.name.lower()
 
 
+def _is_introduction(section: SectionPlan) -> bool:
+    """Введение."""
+    return "введени" in section.name.lower()
+
+
 def _is_chapter_intro(section: SectionPlan, plan: list[SectionPlan], idx: int) -> bool:
     """Глава, за которой идут подразделы (1.1, 1.2, ...) — нужен только краткий вводный абзац."""
     name_lower = section.name.lower()
@@ -120,19 +125,25 @@ _BANNED_PHRASES_MAP = {
     "таким образом ": "",
     "стоит отметить, что ": "",
     "стоит отметить,": "",
+    "стоит отметить ": "",
     "стоит подчеркнуть, что ": "",
     "стоит подчеркнуть,": "",
+    "стоит подчеркнуть ": "",
     "необходимо отметить, что ": "",
     "необходимо отметить,": "",
+    "необходимо отметить ": "",
     "следует подчеркнуть, что ": "",
     "следует подчеркнуть,": "",
+    "следует подчеркнуть ": "",
     "следует отметить, что ": "",
     "следует отметить,": "",
+    "следует отметить ": "",
     "не менее важным является ": "",
     "особое внимание следует уделить ": "",
     "важно понимать, что ": "",
     "нельзя не отметить, что ": "",
     "нельзя не отметить,": "",
+    "нельзя не отметить ": "",
     "подводя итоги,": "",
     "подводя итоги ": "",
     "на основании вышеизложенного,": "",
@@ -207,6 +218,89 @@ def _remove_banned_phrases(text: str) -> str:
     return result
 
 
+def _dedup_paragraphs(text: str, threshold: float = 0.28) -> str:
+    """Удалить абзацы, которые дублируют ранее написанные (по 3-грамному перекрытию).
+
+    Решает проблему «два AI-текста склеены»: когда expand_to_target дописывает
+    абзацы, повторяющие темы из первоначальной генерации.
+    """
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip() and len(p.strip()) > 80]
+    if len(paragraphs) < 3:
+        return text
+
+    def _trigrams(t: str) -> set:
+        words = re.findall(r'[а-яёa-z]{3,}', t.lower())
+        if len(words) < 3:
+            return set()
+        return {(words[i], words[i + 1], words[i + 2]) for i in range(len(words) - 2)}
+
+    kept = [paragraphs[0]]
+    removed = 0
+    for para in paragraphs[1:]:
+        pg = _trigrams(para)
+        if not pg:
+            kept.append(para)
+            continue
+        is_dup = False
+        for prev in kept:
+            prev_g = _trigrams(prev)
+            if not prev_g:
+                continue
+            common = len(pg & prev_g)
+            ratio = common / min(len(pg), len(prev_g))
+            if ratio > threshold:
+                is_dup = True
+                break
+        if is_dup:
+            removed += 1
+        else:
+            kept.append(para)
+
+    if removed:
+        logger.info("Дедупликация абзацев: удалено %d повторных абзацев", removed)
+    return '\n\n'.join(kept)
+
+
+def _remove_fabricated_stats(text: str) -> str:
+    """Заменить выдуманные проценты и статистику без указания автора.
+
+    Если в предложении есть «XX%» но нет «Автор (Год)», проценты
+    заменяются качественными формулировками.
+    """
+    def _fix_sentence(sent: str) -> str:
+        if not re.search(r'\d{2,3}\s*%', sent):
+            return sent
+        # Есть процент — проверяем наличие атрибуции автора
+        if re.search(r'[А-ЯЁA-Z][а-яёa-z]{2,}\s*\(\d{4}\)', sent):
+            return sent  # есть автор+год — оставляем
+        # Нет атрибуции — заменяем проценты
+        sent = re.sub(r'на\s+\d{2,3}\s*%', 'существенно', sent)
+        sent = re.sub(r'в\s+\d{2,3}\s*%\s*(случаев|ситуаций|классов|школ|групп)', r'в большинстве \1', sent)
+        sent = re.sub(
+            r'\d{2,3}\s*%\s*(учащихся|учеников|школьников|студентов|детей|обучающихся|педагогов|учителей|респондентов)',
+            r'значительная часть \1', sent,
+        )
+        sent = re.sub(r'\d{2,3}\s*%', '', sent)
+        sent = re.sub(r'  +', ' ', sent)
+        return sent
+
+    paragraphs = text.split('\n')
+    result = []
+    stats_removed = 0
+    for para in paragraphs:
+        sentences = re.split(r'(?<=[.!?])\s+', para)
+        fixed = []
+        for s in sentences:
+            f = _fix_sentence(s)
+            if f != s:
+                stats_removed += 1
+            fixed.append(f)
+        result.append(' '.join(fixed))
+    if stats_removed:
+        logger.info("Удалено %d выдуманных статистик (проценты без автора)", stats_removed)
+    return '\n'.join(result)
+
+
 def clean_section_text(name: str, text: str) -> str:
     """Постобработка текста раздела: убрать markdown, дубль заголовка, AI-фразы."""
     # Убрать markdown-разметку
@@ -231,6 +325,9 @@ def clean_section_text(name: str, text: str) -> str:
 
     # Удалить запрещённые AI-фразы (постпроцессинг — последний рубеж обороны)
     text = _remove_banned_phrases(text)
+
+    # Удалить выдуманные проценты/статистику без указания автора
+    text = _remove_fabricated_stats(text)
 
     # Нормализация пробелов и переносов
     text = normalize_text(text)
@@ -350,9 +447,12 @@ async def generate_section(
         "\nЗАПРЕТ НА БЕЗЫМЯННЫЕ ИССЛЕДОВАНИЯ:"
         "\n- НЕЛЬЗЯ писать «исследование 2020 года показало», «по данным исследований», «учёные доказали»."
         "\n- КАЖДАЯ ссылка на исследование ОБЯЗАНА содержать фамилию автора и год: «Иванов (2020) установил»."
-        "\n- НЕЛЬЗЯ выдумывать статистику: «повышает на 40%», «в 50 школах» — без автора и года."
-        "\n- Если не можешь привязать факт к конкретному автору — перефразируй как общее утверждение"
-        "\n  БЕЗ цифр и процентов."
+        "\n"
+        "\nЗАПРЕТ НА ВЫДУМАННЫЕ ПРОЦЕНТЫ И СТАТИСТИКУ:"
+        "\n- НЕЛЬЗЯ писать «повышение на 20%», «в 85% случаев», «30% учеников», «снижение на 40%»."
+        "\n- Точные проценты БЕЗ привязки к автору (Фамилия, Год) = фабрикация данных."
+        "\n- Используй качественные оценки: «существенно», «в большинстве случаев», «заметное улучшение»."
+        "\n- Конкретные цифры допустимы ТОЛЬКО со ссылкой: «Петров (2019) показал рост на 15%»."
         "\n"
         "\nЗАПРЕТ НА ОБОБЩАЮЩИЕ КОНЦОВКИ:"
         "\n- НЕ заканчивай абзац обобщающим предложением (это AI-маркер)."
@@ -366,7 +466,10 @@ async def generate_section(
         "\n- Чередуй длинные (25-35 слов) и короткие (8-15 слов) предложения."
         "\n- Начинай абзацы по-разному: с факта, с имени автора, с вопроса, с примера. НЕ начинай"
         "\n  подряд два абзаца с одинаковой конструкции."
-        "\n- Используй только общеизвестные, легко проверяемые данные.",
+        "\n- Используй только общеизвестные, легко проверяемые данные."
+        "\n- Используй не более 5-7 уникальных авторов (Фамилия, Год) на подраздел."
+        "\n- Предпочитай ссылаться на авторов из предыдущих разделов, а не вводить новых."
+        "\n- В КАЖДОМ подразделе допустимо 1-2 НОВЫХ автора, остальные — уже упомянутые ранее.",
         "\nВАЖНО:"
         "\n- НЕ начинай текст с заголовка раздела — заголовок добавляется автоматически."
         "\n- НЕ используй markdown-разметку (символы #, ##, **, *, >, ```, -)."
@@ -467,12 +570,15 @@ async def expand_to_target(
 ) -> tuple[list[GeneratedSection], dict]:
     """Шаг 3: Расширение до целевого объёма.
 
-    Если суммарный объём < target_chars, дозапрашиваем самый короткий раздел
-    с промптом 'Расширь этот раздел, добавь примеры, детали и аргументацию, нужно ещё N слов'.
+    Стратегия: APPEND-режим — GPT генерирует ТОЛЬКО новые абзацы, которые
+    дописываются к существующему тексту. Это гарантирует монотонный рост.
+    Секции, которые перестали расти (<300 символов прироста), пропускаются.
     """
     total_input = 0
     total_output = 0
     total_cost = 0.0
+    stalled: set[int] = set()  # индексы секций, которые перестали расти
+    iters_done = 0
 
     for iteration in range(MAX_EXPAND_ITERATIONS):
         total_chars = sum(len(s.text) for s in sections)
@@ -480,31 +586,61 @@ async def expand_to_target(
             break
 
         needed_chars = target_chars - total_chars
-        needed_words = max(50, needed_chars // 7)
+        # Запрашиваем 300-600 слов за итерацию (1-2 страницы), не весь дефицит
+        words_this_iter = min(600, max(300, needed_chars // 7))
 
-        # Не расширяем список литературы, заключение и вводные абзацы глав
+        # Не расширяем: библиографию, заключение, введение и вводные абзацы глав
         expandable = [
             (i, s) for i, s in enumerate(sections)
-            if not _is_bibliography(SectionPlan(name=s.name, target_words=0))
+            if i not in stalled
+            and not _is_bibliography(SectionPlan(name=s.name, target_words=0))
             and not _is_conclusion(SectionPlan(name=s.name, target_words=0))
+            and not _is_introduction(SectionPlan(name=s.name, target_words=0))
             and "глава" not in s.name.lower().split(".")[0].strip()
         ]
         if not expandable:
+            # Все хорошие секции застопорились — попробуем заключение
             expandable = [
                 (i, s) for i, s in enumerate(sections)
-                if not _is_bibliography(SectionPlan(name=s.name, target_words=0))
+                if i not in stalled
+                and not _is_bibliography(SectionPlan(name=s.name, target_words=0))
             ]
         if not expandable:
-            expandable = list(enumerate(sections))
+            logger.warning("Все секции застопорились, прерываем расширение на итерации %d", iteration + 1)
+            break
 
+        # Выбираем секцию: самая короткая среди expandable
         shortest_idx, shortest = min(expandable, key=lambda x: len(x[1].text))
+        old_len = len(shortest.text)
 
-        max_tokens = min(16000, max(1500, needed_chars // 3))
+        max_tokens = min(16000, max(2000, words_this_iter * 7))
 
         logger.info(
-            "Расширение '%s' (итерация %d): нужно ещё %d слов (%d/%d символов)",
-            shortest.name, iteration + 1, needed_words, total_chars, target_chars,
+            "Расширение '%s' (итерация %d/%d): +%d слов, %d/%d символов, stalled=%d",
+            shortest.name, iteration + 1, MAX_EXPAND_ITERATIONS,
+            words_this_iter, total_chars, target_chars, len(stalled),
         )
+
+        # Полный текст секции для контекста (лимит ~8000 символов для экономии токенов)
+        existing_text = shortest.text
+        if len(existing_text) > 8000:
+            existing_text = (
+                existing_text[:4000]
+                + "\n[...середина раздела опущена...]\n"
+                + existing_text[-4000:]
+            )
+
+        # Извлечь уже цитированных авторов (чтобы GPT не вводил новых)
+        existing_authors = sorted(set(
+            re.findall(r'([А-ЯЁA-Z][а-яёa-z]{2,})\s*\(\d{4}\)', existing_text)
+        ))
+        authors_hint = ", ".join(existing_authors[:20]) if existing_authors else "нет"
+
+        # Извлечь темы последних абзацев (чтобы GPT не повторял)
+        _paras = [p.strip() for p in existing_text.split('\n\n') if len(p.strip()) > 50]
+        topics_hint = "\n".join(
+            f"  - {p[:80].rstrip()}..." for p in _paras[-6:]
+        ) if _paras else ""
 
         result = await chat_completion(
             messages=[
@@ -512,20 +648,33 @@ async def expand_to_target(
                 {"role": "user", "content": (
                     f"Тема работы: \"{title}\"\n"
                     f"Раздел: {shortest.name}\n\n"
-                    f"Текущий текст раздела:\n{shortest.text}\n\n"
-                    f"Расширь этот раздел, добавь новые примеры, детали и аргументацию, "
-                    f"нужно ещё {needed_words} слов. "
-                    f"Верни ПОЛНЫЙ текст раздела (старый + новый контент, без повторов)."
-                    f"\n\nВАЖНО:"
-                    f"\n- НЕ добавляй заголовок раздела — он добавляется автоматически."
-                    f"\n- НЕ используй markdown-разметку (символы #, ##, **, *, >, ```, -)."
+                    f"ПОЛНЫЙ текст раздела (прочитай ВНИМАТЕЛЬНО, чтобы НЕ повторять):\n"
+                    f"{existing_text}\n\n"
+                    f"Напиши ДОПОЛНИТЕЛЬНЫЕ абзацы для этого раздела — "
+                    f"примерно {words_this_iter} слов нового текста. "
+                    f"Эти абзацы будут ДОБАВЛЕНЫ в конец раздела."
+                    f"\n\nАвторы, уже цитированные в тексте: {authors_hint}."
+                    f"\nИспользуй ТОЛЬКО этих авторов для ссылок. НЕ вводи новых фамилий."
+                    + (f"\n\nТемы последних абзацев (НЕ повторять эти темы):\n{topics_hint}" if topics_hint else "")
+                    + f"\n\nКРИТИЧЕСКИЕ ТРЕБОВАНИЯ:"
+                    f"\n- Прочитай существующий текст ЦЕЛИКОМ."
+                    f"\n- Определи ВСЕ темы и аргументы, которые УЖЕ раскрыты."
+                    f"\n- Пиши ИСКЛЮЧИТЕЛЬНО о том, что ещё НЕ упомянуто."
+                    f"\n- НЕ вводи НОВЫХ авторов — ссылайся ТОЛЬКО на уже цитированных."
+                    f"\n- Рассматривай НОВЫЕ аспекты темы, не затронутые ранее."
+                    f"\n- КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО перефразировать или повторять уже написанное."
+                    f"\n- Текст должен ЛОГИЧЕСКИ ПРОДОЛЖАТЬ существующий раздел."
+                    f"\n"
+                    f"\nФОРМАТ:"
+                    f"\n- Верни ТОЛЬКО новые абзацы (НЕ повторяй существующий текст)."
+                    f"\n- НЕ начинай с заголовка раздела."
+                    f"\n- НЕ используй markdown-разметку."
                     f"\n- Пиши только чистый текст абзацами."
-                    f"\n- Добавляй НОВУЮ информацию, не перефразируй существующую."
-                    f"\n- ЗАПРЕЩЁННЫЕ ФРАЗЫ (НЕЛЬЗЯ использовать): «таким образом», «стоит отметить»,"
-                    f"\n  «необходимо отметить», «следует подчеркнуть», «в данном контексте»,"
-                    f"\n  «не менее важным является», «нельзя не отметить», «подводя итоги»."
                     f"\n- НЕ заканчивай абзацы обобщающими предложениями."
-                    f"\n- КАЖДАЯ ссылка на исследование должна содержать фамилию автора и год."
+                    f"\n- НЕ используй выдуманные проценты и статистику без автора (Год)."
+                    f"\n- ЗАПРЕЩЁННЫЕ ФРАЗЫ: «таким образом», «стоит отметить»,"
+                    f"\n  «необходимо отметить», «следует подчеркнуть», «в данном контексте»."
+                    f"\n- Пиши минимум {words_this_iter} слов."
                 )},
             ],
             model=settings.openai_model_main,
@@ -533,14 +682,33 @@ async def expand_to_target(
             max_tokens=max_tokens,
         )
 
+        new_text = clean_section_text(shortest.name, result["content"])
+        # APPEND: дописываем к существующему тексту
+        combined = shortest.text.rstrip() + "\n\n" + new_text.lstrip()
+        # Дедупликация: убрать абзацы, повторяющие ранее написанное
+        combined = _dedup_paragraphs(combined)
+
         sections[shortest_idx] = GeneratedSection(
             name=shortest.name,
-            text=clean_section_text(shortest.name, result["content"]),
+            text=combined,
             target_words=shortest.target_words,
         )
         total_input += result["input_tokens"]
         total_output += result["output_tokens"]
         total_cost += result["cost_usd"]
+
+        iters_done += 1
+        growth = len(combined) - old_len
+        logger.info("  Прирост: +%d символов (+%.1f стр.)", growth, growth / CHARS_PER_PAGE)
+        if growth < 300:
+            logger.warning("  Секция '%s' застопорилась (прирост %d < 300)", shortest.name, growth)
+            stalled.add(shortest_idx)
+
+    total_chars = sum(len(s.text) for s in sections)
+    logger.info(
+        "Расширение завершено: %d/%d символов (~%.0f стр.), итераций: %d",
+        total_chars, target_chars, total_chars / CHARS_PER_PAGE, iters_done,
+    )
 
     tokens_info = {
         "input_tokens": total_input,
@@ -560,39 +728,87 @@ def assemble_text(sections: list[GeneratedSection], uppercase_names: bool = True
     return normalize_text("\n\n".join(parts))
 
 
-def _clean_bibliography(text: str) -> str:
-    """Постпроцессинг библиографии: дедупликация, сортировка, перенумерация.
+def _normalize_russian_surname(surname: str) -> str:
+    """Нормализовать русскую фамилию: убрать женские окончания, привести к основе.
 
-    1. Разбить на отдельные записи (по номерам: 1. ..., 2. ...)
-    2. Удалить дубликаты (по автору + году)
-    3. Сортировать: русские → иностранные, алфавитно
-    4. Перенумеровать
+    Петрова → петров, Смирнова → смирнов, Лебедева → лебедев, Кузнецова → кузнецов
     """
-    # Извлечь отдельные записи
+    s = surname.lower()
+    # Убираем женские окончания: -ова → -ов, -ева → -ев, -ина → -ин, -ая → -ый/ой
+    for fem, masc in [('ова', 'ов'), ('ева', 'ев'), ('ёва', 'ёв'), ('ина', 'ин'), ('ская', 'ск'), ('цкая', 'цк')]:
+        if s.endswith(fem):
+            s = s[:-len(fem)] + masc
+            break
+    return s
+
+
+def _bib_dedup_key(entry_text: str) -> tuple[str, str, str]:
+    """Извлечь фамилию автора, первый инициал и год из библиографической записи.
+
+    Возвращает (normalized_surname, initial_lower, year).
+    Фамилия нормализована: Петрова → петров, Смирнова → смирнов.
+    """
+    # Русский автор: "Фамилия, И. О." или "Фамилия И.О."
+    m = re.match(r'([А-ЯЁ][а-яё]+)\s*,?\s*([А-ЯЁ])\s*\.', entry_text)
+    if m:
+        surname = _normalize_russian_surname(m.group(1))
+        initial = m.group(2).lower()
+    else:
+        # Иностранный: "Surname, A. B." или "Surname A."
+        m = re.match(r'([A-Z][a-z]+)\s*,?\s*([A-Z])\s*\.', entry_text)
+        if m:
+            surname = m.group(1).lower()
+            initial = m.group(2).lower()
+        else:
+            # Фолбэк: первое слово
+            surname = entry_text.split()[0].lower().rstrip(',.:') if entry_text.split() else ""
+            initial = ""
+
+    year_match = re.search(r'(\d{4})', entry_text)
+    year = year_match.group(1) if year_match else ""
+
+    return surname, initial, year
+
+
+def _clean_bibliography(text: str, max_entries: int = 25) -> str:
+    """Постпроцессинг библиографии: агрессивная дедупликация, сортировка, перенумерация.
+
+    Дедупликация:
+    - Фамилия (нормализованная) + инициал + год = дубль (удаляется)
+    - Максимум 2 записи на одну фамилию (даже с разными годами/инициалами)
+    - Максимум max_entries записей (по умолчанию 25)
+    """
+    MAX_PER_SURNAME = 2
+
     entries = re.split(r'\n(?=\d+\.)', text.strip())
     cleaned = []
-    seen_keys: set[str] = set()
+    seen_exact: set[str] = set()       # "surname_initial_year"
+    surname_count: dict[str, int] = {}  # surname -> count
 
     for entry in entries:
         entry = entry.strip()
         if not entry:
             continue
-        # Убрать номер для нормализации
         without_num = re.sub(r'^\d+\.\s*', '', entry).strip()
         if not without_num:
             continue
 
-        # Ключ дедупликации: первые 30 символов (автор + начало названия) в нижнем регистре
-        # + год (если найден)
-        year_match = re.search(r'(\d{4})', without_num)
-        year = year_match.group(1) if year_match else ""
-        # Берём начало записи до первого разделителя / — .
-        key_text = re.split(r'[/\—\-]', without_num)[0].strip().lower()[:40]
-        dedup_key = f"{key_text}_{year}"
+        surname, initial, year = _bib_dedup_key(without_num)
+        exact_key = f"{surname}_{initial}_{year}"
 
-        if dedup_key in seen_keys:
+        # Точный дубль: та же фамилия + инициал + год
+        if exact_key in seen_exact:
+            logger.debug("Библиография: дубль '%s' (ключ %s)", without_num[:50], exact_key)
             continue
-        seen_keys.add(dedup_key)
+        seen_exact.add(exact_key)
+
+        # Лимит записей на одну фамилию
+        count = surname_count.get(surname, 0)
+        if count >= MAX_PER_SURNAME:
+            logger.debug("Библиография: >%d записей '%s', пропуск", MAX_PER_SURNAME, surname)
+            continue
+        surname_count[surname] = count + 1
+
         cleaned.append(without_num)
 
     # Сортировка: русские → иностранные, алфавитно
@@ -601,11 +817,19 @@ def _clean_bibliography(text: str) -> str:
     russian.sort(key=str.lower)
     foreign.sort(key=str.lower)
 
+    all_sorted = russian + foreign
+
+    # Лимит общего количества записей
+    if len(all_sorted) > max_entries:
+        logger.info("Библиография: обрезка %d → %d записей", len(all_sorted), max_entries)
+        all_sorted = all_sorted[:max_entries]
+
     # Перенумеровать
     final = []
-    for i, entry in enumerate(russian + foreign, 1):
+    for i, entry in enumerate(all_sorted, 1):
         final.append(f"{i}. {entry}")
 
+    logger.info("Библиография после очистки: %d записей (из %d)", len(final), len(entries))
     return "\n".join(final)
 
 
@@ -653,6 +877,7 @@ async def _validate_bibliography(
     title: str,
     subject: str,
     system_prompt: str,
+    max_entries: int = 25,
 ) -> tuple[GeneratedSection, dict]:
     """Проверить библиографию на пропущенных авторов и дополнить при необходимости.
 
@@ -662,11 +887,23 @@ async def _validate_bibliography(
     total_output = 0
     total_cost = 0.0
 
+    # Подсчитаем текущие записи
+    current_count = len(re.findall(r'^\d+\.', bib_section.text, re.MULTILINE))
+
     for attempt in range(2):  # Максимум 2 попытки дополнения
         missing = _find_missing_in_bibliography(bib_section.text, cited_authors)
         if not missing:
             logger.info("Библиография: все цитируемые авторы найдены")
             break
+
+        # Не добавляем, если уже достаточно записей
+        if current_count >= max_entries:
+            logger.info("Библиография: уже %d записей (cap=%d), пропускаем добавление %d авторов",
+                         current_count, max_entries, len(missing))
+            break
+
+        # Ограничиваем количество добавляемых за раз (не более 10)
+        missing = missing[:10]
 
         logger.warning(
             "Библиография: %d авторов не найдены (попытка %d): %s",
@@ -704,7 +941,7 @@ async def _validate_bibliography(
             # Добавляем новые записи к библиографии
             combined = bib_section.text.rstrip() + "\n\n" + extra_entries
             # Дедупликация + перенумерация
-            combined = _clean_bibliography(combined)
+            combined = _clean_bibliography(combined, max_entries=max_entries)
             bib_section = GeneratedSection(
                 name=bib_section.name,
                 text=combined,
@@ -714,7 +951,7 @@ async def _validate_bibliography(
     # Финальная очистка библиографии (дедупликация, сортировка, перенумерация)
     bib_section = GeneratedSection(
         name=bib_section.name,
-        text=_clean_bibliography(bib_section.text),
+        text=_clean_bibliography(bib_section.text, max_entries=max_entries),
         target_words=bib_section.target_words,
     )
 
@@ -780,7 +1017,32 @@ async def stepwise_generate(
     for idx, section in enumerate(content_plan):
         # Определяем дополнительные инструкции по типу раздела
         extra = ""
-        if _is_chapter_intro(section, content_plan, idx):
+        if _is_introduction(section):
+            extra = (
+                "\nТРЕБОВАНИЯ К ВВЕДЕНИЮ (строго следуй этой структуре):"
+                "\nВведение — это НЕ пересказ содержания работы и НЕ автореферат."
+                "\nСтруктура введения (каждый пункт — 1-2 абзаца):"
+                "\n1. Актуальность темы (почему эта тема важна СЕЙЧАС, со ссылками на авторов)"
+                "\n2. Степень разработанности проблемы (кратко: кто из учёных занимался этой темой)"
+                "\n3. Цель исследования (ОДНО предложение)"
+                "\n4. Задачи исследования (3-4 конкретные задачи)"
+                "\n5. Объект и предмет исследования (по 1 предложению)"
+                "\n6. Методы исследования: перечисляй ТОЛЬКО теоретические методы — "
+                "анализ научной литературы, систематизация и обобщение научных данных, "
+                "сравнительный анализ, классификация, метод теоретического моделирования. "
+                "НЕ упоминай эмпирические методы (анкетирование, наблюдение, эксперимент, "
+                "метод экспертных оценок), если в работе нет собственного эмпирического исследования"
+                "\n7. Структура работы (1-2 предложения: 'Работа состоит из введения, N глав, "
+                "заключения и списка литературы')"
+                "\n"
+                "\nАБСОЛЮТНЫЕ ЗАПРЕТЫ ДЛЯ ВВЕДЕНИЯ:"
+                "\n- НЕ раскрывай содержание глав подробно!"
+                "\n- НЕ пересказывай теорию, результаты анализа или практические рекомендации!"
+                "\n- НЕ приводи конкретные примеры, методики, классификации из основной части!"
+                "\n- Введение = ТОЛЬКО постановка проблемы + методологический аппарат."
+                "\nОбъём: 2-3 страницы (500-750 слов)."
+            )
+        elif _is_chapter_intro(section, content_plan, idx):
             extra = (
                 "\nЭТОТ РАЗДЕЛ — ВВОДНАЯ ЧАСТЬ ГЛАВЫ (не подраздел)."
                 "\nНапиши РОВНО 1-2 абзаца (100-150 слов):"
@@ -821,8 +1083,10 @@ async def stepwise_generate(
     # Шаг 2.5: Генерация библиографии (если есть) с учётом цитируемых авторов и годов
     if bib_plan:
         cited_authors = _extract_cited_references(sw.sections)
-        logger.info("Найдено %d цитируемых авторов для библиографии: %s",
-                     len(cited_authors), ", ".join(cited_authors[:10]))
+        # Динамический cap: min 25, max 40, на основе числа цитируемых авторов
+        max_bib = max(25, min(40, len(cited_authors) + 5))
+        logger.info("Найдено %d цитируемых авторов для библиографии (cap=%d): %s",
+                     len(cited_authors), max_bib, ", ".join(cited_authors[:10]))
 
         for section in bib_plan:
             generated, tokens_info = await generate_section(
@@ -848,6 +1112,7 @@ async def stepwise_generate(
                     title=title,
                     subject=subject,
                     system_prompt=system_prompt,
+                    max_entries=max_bib,
                 )
                 # Заменяем секцию на исправленную
                 sw.sections[-1] = generated
@@ -872,10 +1137,12 @@ async def stepwise_generate(
     )
     if bib_idx is not None:
         post_expand_refs = _extract_cited_references(sw.sections)
+        # Пересчитать cap после расширения
+        max_bib = max(25, min(40, len(post_expand_refs) + 5))
         if post_expand_refs:
             logger.info(
-                "Пост-расширение: %d цитируемых авторов, проверяем библиографию",
-                len(post_expand_refs),
+                "Пост-расширение: %d цитируемых авторов (cap=%d), проверяем библиографию",
+                len(post_expand_refs), max_bib,
             )
             updated_bib, extra_tokens = await _validate_bibliography(
                 bib_section=sw.sections[bib_idx],
@@ -883,6 +1150,7 @@ async def stepwise_generate(
                 title=title,
                 subject=subject,
                 system_prompt=system_prompt,
+                max_entries=max_bib,
             )
             sw.sections[bib_idx] = updated_bib
             _accumulate(sw, extra_tokens)
