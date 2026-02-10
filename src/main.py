@@ -2,10 +2,11 @@
 
 import asyncio
 import logging
+import random
 import signal
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -149,6 +150,46 @@ async def _ensure_order_in_db(page, avtor24_id: str, status: str = "accepted"):
         logger.warning("Ошибка создания заказа %s из активных: %s", avtor24_id, e)
         await _log_action("error", f"Не удалось создать запись для заказа #{avtor24_id}: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Реалистичная задержка перед доставкой (имитация работы человека)
+# ---------------------------------------------------------------------------
+
+# Базовое время «работы» в минутах по типу работы
+_DELIVERY_BASE_MIN: dict[str, int] = {
+    "Эссе": 20,
+    "Сочинение": 20,
+    "Реферат": 40,
+    "Доклад": 30,
+    "Курсовая работа": 90,
+    "Выпускная квалификационная работа (ВКР)": 240,
+    "Дипломная работа": 240,
+    "Контрольная работа": 30,
+    "Решение задач": 25,
+    "Ответы на вопросы": 20,
+    "Презентации": 30,
+    "Перевод": 25,
+    "Бизнес-план": 90,
+    "Отчёт по практике": 60,
+    "Научно-исследовательская работа (НИР)": 120,
+    "Статья": 40,
+}
+_DELIVERY_PER_PAGE = 3       # минут на страницу
+_DELIVERY_MIN_TOTAL = 15     # минимальная задержка
+_DELIVERY_MAX_TOTAL = 480    # максимум 8 часов
+
+
+def _calculate_delivery_delay(work_type: str | None, pages: int | None) -> int:
+    """Рассчитать реалистичную задержку (в минутах) перед отправкой работы.
+
+    Формула: base[work_type] + pages × 3 мин, ±20% рандом.
+    """
+    base = _DELIVERY_BASE_MIN.get(work_type or "", 30)
+    page_count = pages or 10
+    total = base + page_count * _DELIVERY_PER_PAGE
+    randomized = total * random.uniform(0.8, 1.2)
+    return max(_DELIVERY_MIN_TOTAL, min(_DELIVERY_MAX_TOTAL, int(randomized)))
 
 
 async def _retry_async(coro_func, *args, max_retries: int = 3, **kwargs):
@@ -573,8 +614,10 @@ async def process_accepted_orders_job() -> None:
     from src.scraper.auth import login
     from src.scraper.chat import send_file_with_message
     from src.scraper.browser import browser_manager
+    from src.scraper.order_detail import fetch_order_detail
     from src.generator.router import generate_and_check
     from src.docgen.builder import build_docx
+    from src.database.crud import update_order_fields
 
     await _track_task()
     try:
@@ -593,6 +636,52 @@ async def process_accepted_orders_job() -> None:
             if _shutting_down or not bot_running:
                 break
             try:
+                # === Перепарсинг страницы заказа (актуальные данные) ===
+                # Заказчик мог изменить условия через Ассистента —
+                # обязательно перечитываем страницу перед генерацией.
+                try:
+                    detail_url = f"/order/getoneorder/{order.avtor24_id}"
+                    async with browser_manager.page_lock:
+                        detail = await _retry_async(fetch_order_detail, page, detail_url)
+                    if detail:
+                        upd = {}
+                        if detail.title and detail.title != order.title:
+                            upd["title"] = detail.title
+                        if detail.work_type and detail.work_type != (order.work_type or ""):
+                            upd["work_type"] = detail.work_type
+                        if detail.subject and detail.subject != (order.subject or ""):
+                            upd["subject"] = detail.subject
+                        if detail.description and detail.description != (order.description or ""):
+                            upd["description"] = detail.description
+                        if detail.pages_min and detail.pages_min != order.pages_min:
+                            upd["pages_min"] = detail.pages_min
+                        if detail.pages_max and detail.pages_max != order.pages_max:
+                            upd["pages_max"] = detail.pages_max
+                        if detail.required_uniqueness and detail.required_uniqueness != order.required_uniqueness:
+                            upd["required_uniqueness"] = detail.required_uniqueness
+                        if detail.antiplagiat_system and detail.antiplagiat_system != (order.antiplagiat_system or ""):
+                            upd["antiplagiat_system"] = detail.antiplagiat_system
+                        if detail.font_size and detail.font_size != (order.font_size or 14):
+                            upd["font_size"] = detail.font_size
+                        if detail.line_spacing and detail.line_spacing != (order.line_spacing or 1.5):
+                            upd["line_spacing"] = detail.line_spacing
+                        if detail.budget_rub and detail.budget_rub != order.budget_rub:
+                            upd["budget_rub"] = detail.budget_rub
+                        if upd:
+                            async with async_session() as session:
+                                await update_order_fields(session, order.id, **upd)
+                            changes = ", ".join(f"{k}={v}" for k, v in upd.items())
+                            await _log_action(
+                                "generate",
+                                f"Заказ #{order.avtor24_id}: условия обновлены перед генерацией: {changes}",
+                                order_id=order.id,
+                            )
+                            # Перечитываем заказ с актуальными полями
+                            async with async_session() as session:
+                                order = await get_order_by_avtor24_id(session, order.avtor24_id)
+                except Exception as e:
+                    logger.warning("Ошибка перепарсинга заказа %s перед генерацией: %s", order.avtor24_id, e)
+
                 await _log_action(
                     "generate",
                     f"Начата генерация: {order.work_type}, ~{order.pages_max or order.pages_min or '?'} стр",
@@ -688,78 +777,27 @@ async def process_accepted_orders_job() -> None:
                         )
                     continue
 
-                # Загрузка готовой работы заказчику
-                await browser_manager.random_delay(min_sec=3, max_sec=8)
-                delivery_message = (
-                    "Добрый день! Работа готова, загружаю файл. "
-                    "Если потребуются правки — пишите, исправлю."
+                # === Ставим в очередь на доставку с реалистичной задержкой ===
+                delay_min = _calculate_delivery_delay(
+                    order.work_type, order.pages_max or order.pages_min,
                 )
-
-                async with browser_manager.page_lock:
-                    send_ok = await _retry_async(
-                        send_file_with_message, page, order.avtor24_id, str(docx_path), delivery_message,
+                deliver_after = datetime.now() + timedelta(minutes=delay_min)
+                async with async_session() as session:
+                    await update_order_status(
+                        session, order.id, "ready",
+                        generated_file_path=str(docx_path),
+                        uniqueness_percent=uniqueness,
+                        api_cost_usd=gen_result.cost_usd,
+                        api_tokens_used=gen_result.total_tokens,
+                        # Храним время доставки в error_message (ISO формат)
+                        error_message=deliver_after.isoformat(),
                     )
-
-                if send_ok:
-                    async with async_session() as session:
-                        income = estimate_income(order.bid_price) if order.bid_price else 0
-                        await update_order_status(
-                            session, order.id, "delivered",
-                            generated_file_path=str(docx_path),
-                            income_rub=income,
-                        )
-
-                        # Сохраняем исходящее сообщение
-                        await create_message(
-                            session,
-                            order_id=order.id,
-                            direction="outgoing",
-                            text=delivery_message,
-                            is_auto_reply=True,
-                        )
-
-                        # Дневная статистика
-                        today = date.today()
-                        stats = await get_daily_stats(session, today)
-                        await upsert_daily_stats(
-                            session,
-                            today,
-                            orders_delivered=(stats.orders_delivered if stats else 0) + 1,
-                            income_rub=(stats.income_rub if stats else 0) + income,
-                            api_cost_usd=(stats.api_cost_usd if stats else 0) + gen_result.cost_usd,
-                            api_tokens_used=(stats.api_tokens_used if stats else 0) + gen_result.total_tokens,
-                        )
-
-                        # Уведомление
-                        await push_notification(
-                            session,
-                            type="order_delivered",
-                            title=f"Отправлено: {order.title[:60]}",
-                            body={
-                                "order_id": order.avtor24_id,
-                                "pages": gen_result.pages_approx,
-                                "uniqueness": uniqueness,
-                                "antiplagiat_system": order.antiplagiat_system or "textru",
-                                "income": income,
-                                "api_cost": gen_result.cost_usd,
-                            },
-                            order_id=order.id,
-                        )
-
-                    await _log_action("deliver", "Файл загружен в чат заказчика", order_id=order.id)
-                    await _log_action(
-                        "chat",
-                        f"Отправлено: \"{delivery_message}\"",
-                        order_id=order.id,
-                    )
-                else:
-                    async with async_session() as session:
-                        await update_order_status(
-                            session, order.id, "error",
-                            error_message="Не удалось отправить файл заказчику",
-                            generated_file_path=str(docx_path),
-                        )
-                    await _log_action("error", "Не удалось отправить файл", order_id=order.id)
+                await _log_action(
+                    "generate",
+                    f"Работа готова, доставка запланирована через ~{delay_min} мин "
+                    f"(в {deliver_after.strftime('%H:%M')})",
+                    order_id=order.id,
+                )
 
             except Exception as e:
                 logger.error("Ошибка обработки заказа #%s: %s", order.avtor24_id, e)
@@ -780,6 +818,117 @@ async def process_accepted_orders_job() -> None:
                         order_id=order.id,
                     )
                 await _log_action("error", f"Ошибка обработки: {e}", order_id=order.id)
+
+        # ===================================================================
+        # Этап 2: Доставка готовых работ (статус "ready", время пришло)
+        # ===================================================================
+        async with async_session() as session:
+            ready_orders = await get_orders_by_status(session, "ready")
+
+        for order in ready_orders:
+            if _shutting_down or not bot_running:
+                break
+            try:
+                # Проверяем: наступило ли время доставки?
+                deliver_after_str = order.error_message or ""
+                if deliver_after_str:
+                    try:
+                        deliver_after = datetime.fromisoformat(deliver_after_str)
+                        if datetime.now() < deliver_after:
+                            remaining = (deliver_after - datetime.now()).total_seconds() / 60
+                            logger.debug(
+                                "Заказ %s: доставка через ~%.0f мин",
+                                order.avtor24_id, remaining,
+                            )
+                            continue  # Ещё не время
+                    except (ValueError, TypeError):
+                        pass  # Некорректная дата — доставляем сразу
+
+                docx_path = order.generated_file_path
+                if not docx_path:
+                    await _log_action("error", "Нет файла для доставки", order_id=order.id)
+                    async with async_session() as session:
+                        await update_order_status(session, order.id, "error",
+                                                  error_message="Файл для доставки не найден")
+                    continue
+
+                # Доставляем файл заказчику
+                await browser_manager.random_delay(min_sec=3, max_sec=8)
+                delivery_message = (
+                    "Добрый день! Работа готова, загружаю файл. "
+                    "Если потребуются правки — пишите, исправлю."
+                )
+
+                async with browser_manager.page_lock:
+                    send_ok = await _retry_async(
+                        send_file_with_message, page, order.avtor24_id,
+                        str(docx_path), delivery_message,
+                    )
+
+                if send_ok:
+                    async with async_session() as session:
+                        income = estimate_income(order.bid_price) if order.bid_price else 0
+                        await update_order_status(
+                            session, order.id, "delivered",
+                            income_rub=income,
+                            error_message=None,  # Очищаем — там было время доставки
+                        )
+
+                        await create_message(
+                            session,
+                            order_id=order.id,
+                            direction="outgoing",
+                            text=delivery_message,
+                            is_auto_reply=True,
+                        )
+
+                        today = date.today()
+                        stats = await get_daily_stats(session, today)
+                        await upsert_daily_stats(
+                            session,
+                            today,
+                            orders_delivered=(stats.orders_delivered if stats else 0) + 1,
+                            income_rub=(stats.income_rub if stats else 0) + income,
+                            api_cost_usd=(stats.api_cost_usd if stats else 0) + (order.api_cost_usd or 0),
+                            api_tokens_used=(stats.api_tokens_used if stats else 0) + (order.api_tokens_used or 0),
+                        )
+
+                        await push_notification(
+                            session,
+                            type="order_delivered",
+                            title=f"Отправлено: {order.title[:60]}",
+                            body={
+                                "order_id": order.avtor24_id,
+                                "uniqueness": order.uniqueness_percent or 0,
+                                "antiplagiat_system": order.antiplagiat_system or "textru",
+                                "income": income,
+                                "api_cost": order.api_cost_usd or 0,
+                            },
+                            order_id=order.id,
+                        )
+
+                    await _log_action("deliver", "Файл загружен в чат заказчика", order_id=order.id)
+                    await _log_action(
+                        "chat",
+                        f"Отправлено: \"{delivery_message}\"",
+                        order_id=order.id,
+                    )
+                else:
+                    async with async_session() as session:
+                        await update_order_status(
+                            session, order.id, "error",
+                            error_message="Не удалось отправить файл заказчику",
+                        )
+                    await _log_action("error", "Не удалось отправить файл", order_id=order.id)
+
+            except Exception as e:
+                logger.error("Ошибка доставки заказа #%s: %s", order.avtor24_id, e)
+                async with async_session() as session:
+                    await update_order_status(
+                        session, order.id, "error",
+                        error_message=f"Ошибка доставки: {str(e)[:400]}",
+                    )
+                await _log_action("error", f"Ошибка доставки: {e}", order_id=order.id)
 
     except Exception as e:
         logger.error("Критическая ошибка в process_accepted_orders_job: %s", e)
