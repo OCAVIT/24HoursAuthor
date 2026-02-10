@@ -429,37 +429,9 @@ async def scan_orders_job() -> None:
                             order_id=db_order.id,
                         )
 
-                    # Приветственное сообщение в чат после ставки
-                    try:
-                        from src.chat_ai.responder import generate_greeting_message
-                        from src.scraper.chat import send_message as chat_send_message
-
-                        await browser_manager.random_delay(min_sec=3, max_sec=8)
-                        greeting_msg = await generate_greeting_message(
-                            work_type=detail.work_type,
-                            subject=detail.subject,
-                            title=detail.title,
-                            description=detail.description,
-                            bid_price=bid_price,
-                        )
-                        if greeting_msg:
-                            send_ok = await chat_send_message(page, summary.order_id, greeting_msg.text)
-                            if send_ok:
-                                async with async_session() as session:
-                                    await create_message(
-                                        session,
-                                        order_id=db_order.id,
-                                        direction="outgoing",
-                                        text=greeting_msg.text,
-                                        is_auto_reply=True,
-                                    )
-                                await _log_action(
-                                    "chat",
-                                    f"Приветственное сообщение отправлено: \"{greeting_msg.text[:100]}\"",
-                                    order_id=db_order.id,
-                                )
-                    except Exception as e:
-                        logger.warning("Ошибка отправки приветственного сообщения: %s", e)
+                    # Комментарий к ставке уже служит приветствием.
+                    # Дополнительное сообщение в чат НЕ отправляем — ждём одобрения.
+                    # Уточняющие вопросы зададим после принятия (check_accepted_bids_job).
 
                 else:
                     await _log_action(
