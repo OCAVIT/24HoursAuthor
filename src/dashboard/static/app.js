@@ -488,7 +488,7 @@ function dashboard() {
            ================================================== */
         renderChart(canvasId, storeKey, type, labels, datasets, extraOpts = {}) {
             const canvas = document.getElementById(canvasId);
-            if (!canvas) return;
+            if (!canvas || canvas.offsetParent === null) return;
             if (this[storeKey]) this[storeKey].destroy();
 
             const isDoughnut = type === 'doughnut' || type === 'pie';

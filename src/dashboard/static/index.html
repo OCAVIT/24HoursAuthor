@@ -212,7 +212,7 @@
 
                 <!-- Status Tabs -->
                 <div class="flex flex-wrap gap-2 mb-4">
-                    <template x-for="tab in orderTabs" :key="tab.value">
+                    <template x-for="tab in orderTabs" :key="tab.label">
                         <button @click="ordersFilter.status = tab.value; loadOrders()"
                                 :class="ordersFilter.status === tab.value ? 'bg-accent-600 text-white' : 'bg-surface-800 text-gray-400 hover:text-gray-200'"
                                 class="px-4 py-1.5 rounded-lg text-sm font-medium transition" x-text="tab.label">
@@ -441,7 +441,7 @@
 
                 <!-- Filter Tabs -->
                 <div class="flex flex-wrap items-center gap-2 mb-4">
-                    <template x-for="tab in notifTabs" :key="tab.value">
+                    <template x-for="tab in notifTabs" :key="tab.label">
                         <button @click="notifFilter = tab.value; loadNotifications()"
                                 :class="notifFilter === tab.value ? 'bg-accent-600 text-white' : 'bg-surface-800 text-gray-400 hover:text-gray-200'"
                                 class="px-4 py-1.5 rounded-lg text-sm font-medium transition" x-text="tab.label">
@@ -479,7 +479,7 @@
 
                 <!-- Filters -->
                 <div class="flex flex-wrap items-center gap-2 mb-4">
-                    <template x-for="tab in logTabs" :key="tab.value">
+                    <template x-for="tab in logTabs" :key="tab.label">
                         <button @click="logFilter = tab.value; loadLogs()"
                                 :class="logFilter === tab.value ? 'bg-accent-600 text-white' : 'bg-surface-800 text-gray-400 hover:text-gray-200'"
                                 class="px-3 py-1.5 rounded-lg text-xs font-medium transition" x-text="tab.label">
