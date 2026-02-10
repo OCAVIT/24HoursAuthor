@@ -951,55 +951,50 @@ async def _handle_assistant_messages(
     order,
     assistant_msgs: list,
 ) -> None:
-    """Обработать сообщения Ассистента: перепарсить условия заказа с детальной страницы.
+    """Обработать сообщения Ассистента: извлечь изменения через GPT-4o-mini.
 
     Ассистент на Автор24 отправляет сообщения об изменении условий заказа.
-    Мы заходим на страницу заказа, парсим новые условия и обновляем БД.
+    GPT-4o-mini парсит текст сообщения и извлекает конкретные изменения.
     Если условия неприемлемые — можно отменить заказ (кнопка "Отменить").
     """
-    from src.scraper.order_detail import fetch_order_detail
     from src.scraper.browser import browser_manager
     from src.scraper.chat import cancel_order
     from src.database.crud import update_order_fields
     from src.analyzer.price_calculator import is_profitable
+    from src.chat_ai.responder import extract_order_changes
 
     try:
         await _log_action(
             "chat",
-            f"Обнаружено {len(assistant_msgs)} сообщений Ассистента, перепарсинг условий",
+            f"Обнаружено {len(assistant_msgs)} сообщений Ассистента, GPT-извлечение изменений",
             order_id=order.id,
         )
 
-        # Переходим на страницу заказа и парсим актуальные условия
-        order_url = f"/order/getoneorder/{avtor24_id}"
-        detail = await _retry_async(fetch_order_detail, page, order_url)
+        # Собираем текст всех сообщений ассистента
+        combined_text = "\n".join(m.text for m in assistant_msgs)
 
-        # Собираем поля для обновления (только изменившиеся)
-        update_kwargs = {}
-        if detail.title and detail.title != order.title:
-            update_kwargs["title"] = detail.title
-        if detail.work_type and detail.work_type != (order.work_type or ""):
-            update_kwargs["work_type"] = detail.work_type
-        if detail.subject and detail.subject != (order.subject or ""):
-            update_kwargs["subject"] = detail.subject
-        if detail.description and detail.description != (order.description or ""):
-            update_kwargs["description"] = detail.description
-        if detail.required_uniqueness and detail.required_uniqueness != order.required_uniqueness:
-            update_kwargs["required_uniqueness"] = detail.required_uniqueness
-        if detail.antiplagiat_system and detail.antiplagiat_system != (order.antiplagiat_system or ""):
-            update_kwargs["antiplagiat_system"] = detail.antiplagiat_system
-        if detail.pages_min and detail.pages_min != order.pages_min:
-            update_kwargs["pages_min"] = detail.pages_min
-        if detail.pages_max and detail.pages_max != order.pages_max:
-            update_kwargs["pages_max"] = detail.pages_max
-        if detail.font_size and detail.font_size != (order.font_size or 14):
-            update_kwargs["font_size"] = detail.font_size
-        if detail.line_spacing and detail.line_spacing != (order.line_spacing or 1.5):
-            update_kwargs["line_spacing"] = detail.line_spacing
-        if detail.budget_rub and detail.budget_rub != order.budget_rub:
-            update_kwargs["budget_rub"] = detail.budget_rub
-        if detail.deadline and detail.deadline != (str(order.deadline) if order.deadline else None):
-            update_kwargs["deadline"] = detail.deadline
+        # Текущее состояние заказа для контекста GPT
+        current_order = {
+            "title": order.title,
+            "work_type": order.work_type,
+            "subject": order.subject,
+            "pages_min": order.pages_min,
+            "pages_max": order.pages_max,
+            "required_uniqueness": order.required_uniqueness,
+            "budget_rub": order.budget_rub,
+        }
+
+        # GPT-4o-mini извлекает изменения из текста сообщения
+        update_kwargs = await extract_order_changes(combined_text, current_order)
+
+        # Убираем поля, где значение не изменилось
+        unchanged = []
+        for k, v in list(update_kwargs.items()):
+            current = getattr(order, k, None)
+            if current is not None and str(current) == str(v):
+                unchanged.append(k)
+        for k in unchanged:
+            del update_kwargs[k]
 
         if update_kwargs:
             async with async_session() as session:
@@ -1241,7 +1236,7 @@ async def chat_responder_job() -> None:
     from src.scraper.auth import login
     from src.scraper.chat import get_active_chats, get_messages, send_message, download_chat_files
     from src.scraper.browser import browser_manager
-    from src.chat_ai.responder import generate_response, parse_customer_answer, generate_proactive_message, classify_assistant_messages
+    from src.chat_ai.responder import generate_response, parse_customer_answer, generate_proactive_message
     from src.database.crud import update_order_fields
 
     await _track_task()
@@ -1283,29 +1278,11 @@ async def chat_responder_job() -> None:
                     continue
 
                 # --- Обработка сообщений Ассистента (изменение условий заказа) ---
-                # GPT-4o-mini классифицирует сообщения: какие от платформы
-                # Дедупликация: сначала фильтруем уже обработанные по хешу текста
+                # Детекция по хардкод-паттернам (быстро, бесплатно, надёжно).
+                # GPT-4o-mini используется дальше для извлечения ДАННЫХ из текста.
+                assistant_msgs = [m for m in chat_messages if m.is_assistant]
+                # Дедупликация: отбрасываем уже обработанные сообщения (по хешу текста)
                 seen = _processed_assistant_msgs.get(avtor24_id, set())
-                candidate_msgs = [
-                    {"index": i, "text": m.text}
-                    for i, m in enumerate(chat_messages)
-                    if not m.is_system and hash(m.text.strip()) not in seen
-                ]
-                # Классификация через GPT (только если есть непроверенные)
-                assistant_indices: set[int] = set()
-                if candidate_msgs:
-                    try:
-                        classified = await classify_assistant_messages(candidate_msgs)
-                        assistant_indices = set(classified)
-                    except Exception as e:
-                        logger.warning("GPT-классификация не удалась для %s: %s, фолбэк на хардкод", avtor24_id, e)
-                        # Фолбэк: используем хардкод is_assistant
-                        assistant_indices = {
-                            i for i, m in enumerate(chat_messages) if m.is_assistant
-                        }
-
-                assistant_msgs = [chat_messages[i] for i in assistant_indices if i < len(chat_messages)]
-                # Фильтруем уже обработанные
                 new_assistant_msgs = [
                     m for m in assistant_msgs
                     if hash(m.text.strip()) not in seen
@@ -1342,8 +1319,7 @@ async def chat_responder_job() -> None:
 
                 # Последнее сообщение — от заказчика?
                 last_msg = chat_messages[-1]
-                last_idx = len(chat_messages) - 1
-                if last_idx in assistant_indices:
+                if last_msg.is_assistant:
                     continue  # Ассистент — не отвечаем
 
                 if not last_msg.is_incoming:

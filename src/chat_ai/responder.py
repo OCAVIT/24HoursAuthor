@@ -458,55 +458,62 @@ async def detect_customer_approval(
     }
 
 
-async def classify_assistant_messages(
-    messages: list[dict],
-) -> list[int]:
-    """Классифицировать сообщения чата через GPT-4o-mini: найти уведомления платформы.
+async def extract_order_changes(
+    assistant_message_text: str,
+    current_order: dict,
+) -> dict:
+    """Извлечь изменения заказа из текста сообщения Ассистента через GPT-4o-mini.
 
-    На Автор24 "Ассистент" (платформа) присылает уведомления об изменении условий
-    заказа в виде обычных сообщений в чат. Формат: "Заказчик изменил в заказе: ..."
-    и другие системные сообщения.
+    На Автор24 платформа присылает уведомления вида:
+    "Заказчик изменил в заказе: тема — Новая тема"
+    "Заказчик изменил в заказе: кол-во страниц — 25"
+
+    GPT парсит текст и возвращает структурированные изменения.
 
     Args:
-        messages: Список сообщений [{index: int, text: str}, ...].
-            Передаём только текст и индекс, без лишних данных.
+        assistant_message_text: Текст сообщения Ассистента.
+        current_order: Текущие значения полей заказа в БД (для контекста).
 
     Returns:
-        Список индексов сообщений, которые являются уведомлениями платформы
-        (ассистент / изменение условий / системные).
+        Словарь изменённых полей: {"title": "...", "pages_min": 25, ...}
+        Только поля с реальными изменениями. Пустой dict если ничего не извлечено.
     """
-    if not messages:
-        return []
-
-    # Формируем текст сообщений для классификации
-    msgs_text = "\n".join(
-        f"[{m['index']}] {m['text'][:300]}" for m in messages
-    )
-
     prompt_messages = [
         {
             "role": "system",
             "content": (
-                "Ты классифицируешь сообщения из чата на платформе Автор24 (фриланс для студенческих работ). "
-                "В чате участвуют: заказчик, автор (исполнитель) и платформа (ассистент). "
-                "Платформа отправляет уведомления об изменении условий заказа. "
-                "Типичные признаки сообщений платформы:\n"
-                "- \"Заказчик изменил в заказе: ...\" (изменение условий)\n"
-                "- \"Условия заказа изменены\" / \"Условия заказа обновлены\"\n"
-                "- \"Заказчик продлил срок\" / \"Заказчик изменил дедлайн\"\n"
-                "- Любые автоматические уведомления об изменениях параметров заказа\n"
-                "- Короткие формальные сообщения без личного обращения\n\n"
-                "НЕ считай платформенными:\n"
-                "- Личные сообщения от заказчика (вопросы, просьбы, обсуждение)\n"
-                "- Сообщения от автора\n"
-                "- Системные уведомления типа \"Вы сделали ставку\", \"Вас выбрали автором\"\n\n"
-                "Верни JSON: {\"platform_indices\": [список индексов сообщений от платформы]}\n"
-                "Если таких сообщений нет — верни {\"platform_indices\": []}"
+                "Ты парсишь уведомление платформы Автор24 об изменении условий заказа. "
+                "Извлеки из текста какие именно поля заказа изменились и их новые значения.\n\n"
+                "Возможные поля:\n"
+                "- title (string): тема/название работы\n"
+                "- work_type (string): тип работы (Курсовая работа, Реферат, Эссе и т.д.)\n"
+                "- subject (string): предмет (Экономика, Менеджмент и т.д.)\n"
+                "- description (string): описание/ТЗ заказа\n"
+                "- pages_min (int): мин. количество страниц\n"
+                "- pages_max (int): макс. количество страниц\n"
+                "- required_uniqueness (int): требуемая уникальность в %\n"
+                "- antiplagiat_system (string): система антиплагиата\n"
+                "- deadline (string): дедлайн (дата в формате YYYY-MM-DD)\n"
+                "- budget_rub (int): бюджет в рублях\n"
+                "- font_size (int): размер шрифта\n"
+                "- line_spacing (float): межстрочный интервал\n\n"
+                "Верни JSON с ТОЛЬКО изменёнными полями и их НОВЫМИ значениями.\n"
+                "Пример: {\"title\": \"Новая тема работы\", \"pages_max\": 30}\n"
+                "Если не удалось извлечь конкретные изменения — верни пустой объект: {}"
             ),
         },
         {
             "role": "user",
-            "content": f"Сообщения чата:\n{msgs_text}",
+            "content": (
+                f"Текущий заказ:\n"
+                f"- Тема: {current_order.get('title', '?')}\n"
+                f"- Тип: {current_order.get('work_type', '?')}\n"
+                f"- Предмет: {current_order.get('subject', '?')}\n"
+                f"- Страниц: {current_order.get('pages_min', '?')}-{current_order.get('pages_max', '?')}\n"
+                f"- Уникальность: {current_order.get('required_uniqueness', '?')}%\n"
+                f"- Бюджет: {current_order.get('budget_rub', '?')}₽\n\n"
+                f"Сообщение Ассистента:\n{assistant_message_text}"
+            ),
         },
     ]
 
@@ -514,7 +521,7 @@ async def classify_assistant_messages(
         messages=prompt_messages,
         model=settings.openai_model_fast,
         temperature=0.0,
-        max_tokens=200,
+        max_tokens=300,
     )
 
     try:
@@ -525,17 +532,29 @@ async def classify_assistant_messages(
         except (json.JSONDecodeError, TypeError):
             parsed = {}
 
-    indices = parsed.get("platform_indices", [])
-    # Убеждаемся что это список int
-    indices = [int(i) for i in indices if isinstance(i, (int, float))]
+    # Валидация: оставляем только известные поля с корректными типами
+    valid_fields = {
+        "title": str, "work_type": str, "subject": str, "description": str,
+        "antiplagiat_system": str, "deadline": str,
+        "pages_min": int, "pages_max": int, "required_uniqueness": int,
+        "budget_rub": int, "font_size": int,
+        "line_spacing": float,
+    }
+    changes = {}
+    for field, expected_type in valid_fields.items():
+        if field in parsed and parsed[field] is not None:
+            try:
+                changes[field] = expected_type(parsed[field])
+            except (ValueError, TypeError):
+                pass  # Пропускаем невалидные значения
 
     logger.info(
-        "Классификация сообщений: %d из %d — платформа, %d токенов, $%.4f",
-        len(indices), len(messages),
+        "GPT извлёк изменения из сообщения Ассистента: %s, %d токенов, $%.4f",
+        changes or "(пусто)",
         result.get("total_tokens", 0), result.get("cost_usd", 0),
     )
 
-    return indices
+    return changes
 
 
 def _build_context(
