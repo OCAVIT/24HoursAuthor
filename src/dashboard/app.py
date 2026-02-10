@@ -4,8 +4,11 @@ import csv
 import io
 import os
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional
+
+# Московское время (UTC+3)
+_MSK = timezone(timedelta(hours=3))
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
@@ -88,12 +91,11 @@ async def toggle_bot(user: str = Depends(get_current_user)):
             await create_action_log(session, action=action, details=details)
         # Also broadcast to log websocket
         from src.notifications.websocket import log_manager
-        from datetime import datetime
         await log_manager.broadcast({
             "action": action,
             "details": details,
             "order_id": None,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(_MSK).isoformat(),
         })
     except Exception:
         pass
@@ -172,7 +174,7 @@ async def order_detail(order_id: int, user: str = Depends(get_current_user)):
                 "direction": m.direction,
                 "text": m.text,
                 "is_auto_reply": m.is_auto_reply,
-                "created_at": str(m.created_at),
+                "created_at": _to_msk_iso(m.created_at),
             }
             for m in messages
         ],
@@ -181,7 +183,7 @@ async def order_detail(order_id: int, user: str = Depends(get_current_user)):
                 "id": l.id,
                 "action": l.action,
                 "details": l.details,
-                "created_at": str(l.created_at),
+                "created_at": _to_msk_iso(l.created_at),
             }
             for l in order_logs
         ],
@@ -193,7 +195,7 @@ async def order_detail(order_id: int, user: str = Depends(get_current_user)):
                 "input_tokens": u.input_tokens,
                 "output_tokens": u.output_tokens,
                 "cost_usd": round(u.cost_usd, 4),
-                "created_at": str(u.created_at),
+                "created_at": _to_msk_iso(u.created_at),
             }
             for u in api_usages
         ],
@@ -237,12 +239,11 @@ async def regen_order(order_id: int, user: str = Depends(get_current_user)):
     # WebSocket broadcast в логи
     try:
         from src.notifications.websocket import log_manager
-        from datetime import datetime
         await log_manager.broadcast({
             "action": "generate",
             "details": f"Перегенерация заказа #{order.avtor24_id} запущена вручную",
             "order_id": order_id,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(_MSK).isoformat(),
         })
     except Exception:
         pass
@@ -302,7 +303,7 @@ async def notifications_list(
                 "body": n.body,
                 "order_id": n.order_id,
                 "is_read": n.is_read,
-                "created_at": str(n.created_at),
+                "created_at": _to_msk_iso(n.created_at),
             }
             for n in notifications
         ],
@@ -355,7 +356,7 @@ async def logs_list(
                 "action": l.action,
                 "order_id": l.order_id,
                 "details": l.details,
-                "created_at": str(l.created_at),
+                "created_at": _to_msk_iso(l.created_at),
             }
             for l in logs
         ],
@@ -532,6 +533,18 @@ async def dashboard_index(request: Request):
 # Хелперы
 # ---------------------------------------------------------------------------
 
+def _to_msk_iso(dt) -> str:
+    """Конвертировать datetime в ISO строку с МСК таймзоной."""
+    if dt is None:
+        return ""
+    if isinstance(dt, str):
+        return dt  # Уже строка
+    if dt.tzinfo is None:
+        # Naive datetime — считаем UTC (от БД) → переводим в МСК
+        dt = dt.replace(tzinfo=timezone.utc).astimezone(_MSK)
+    return dt.isoformat()
+
+
 def _order_to_dict(o) -> dict:
     """Конвертировать Order ORM объект в словарь."""
     return {
@@ -547,11 +560,11 @@ def _order_to_dict(o) -> dict:
         "line_spacing": o.line_spacing,
         "required_uniqueness": o.required_uniqueness,
         "antiplagiat_system": o.antiplagiat_system,
-        "deadline": str(o.deadline) if o.deadline else None,
+        "deadline": _to_msk_iso(o.deadline) if o.deadline else None,
         "budget_rub": o.budget_rub,
         "bid_price": o.bid_price,
         "bid_comment": o.bid_comment,
-        "bid_placed_at": str(o.bid_placed_at) if o.bid_placed_at else None,
+        "bid_placed_at": _to_msk_iso(o.bid_placed_at) if o.bid_placed_at else None,
         "score": o.score,
         "status": o.status,
         "generated_file_path": o.generated_file_path,
@@ -561,6 +574,6 @@ def _order_to_dict(o) -> dict:
         "api_tokens_used": o.api_tokens_used,
         "customer_username": o.customer_username,
         "error_message": o.error_message,
-        "created_at": str(o.created_at) if o.created_at else None,
-        "updated_at": str(o.updated_at) if o.updated_at else None,
+        "created_at": _to_msk_iso(o.created_at) if o.created_at else None,
+        "updated_at": _to_msk_iso(o.updated_at) if o.updated_at else None,
     }

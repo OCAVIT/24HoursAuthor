@@ -152,7 +152,7 @@
                     </div>
                     <div class="stat-card">
                         <div class="stat-label">Ставок в ожидании</div>
-                        <div class="stat-value" x-text="stats.bids_pending || 0"></div>
+                        <div class="stat-value" x-text="(stats.bids_pending || 0) + ' / ' + (stats.bids_total || 0)"></div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-label">API расход сегодня</div>
@@ -379,11 +379,11 @@
                 <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
                     <div class="stat-card">
                         <div class="stat-label">Общий доход</div>
-                        <div class="stat-value text-green-400" x-text="fmt(analyticsData.total_income || 0) + ' R'"></div>
+                        <div class="stat-value text-green-400" x-text="fmt(analyticsData.total_income_rub || 0) + ' R'"></div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-label">Расход API</div>
-                        <div class="stat-value text-yellow-400" x-text="'$' + (analyticsData.total_api_cost || 0).toFixed(2)"></div>
+                        <div class="stat-value text-yellow-400" x-text="'$' + (analyticsData.total_api_cost_usd || 0).toFixed(2)"></div>
                     </div>
                     <div class="stat-card">
                         <div class="stat-label">Принято ставок</div>
@@ -506,11 +506,11 @@
                         </span>
                     </div>
                     <div id="logTerminal" class="p-4 h-[600px] overflow-y-auto sidebar-scroll space-y-0.5">
-                        <template x-for="log in logsList" :key="log.id">
+                        <template x-for="log in filteredLogs" :key="log.id || log.timestamp">
                             <div class="flex gap-2 leading-relaxed hover:bg-surface-700/30 px-1 rounded">
-                                <span class="text-gray-600 flex-shrink-0" x-text="formatTime(log.created_at)"></span>
-                                <span :class="logActionClass(log.action)" class="flex-shrink-0 font-bold" x-text="'[' + (log.action || 'INFO').toUpperCase() + ']'"></span>
-                                <span class="text-gray-300" x-text="log.details"></span>
+                                <span class="text-gray-600 flex-shrink-0 w-[70px] text-right" x-text="formatTime(log.created_at || log.timestamp)"></span>
+                                <span :class="logActionClass(log.action)" class="flex-shrink-0 font-bold w-[90px] text-center" x-text="'[' + (log.action || 'INFO').toUpperCase() + ']'"></span>
+                                <span class="text-gray-300 break-words min-w-0" x-text="log.details"></span>
                             </div>
                         </template>
                         <div x-show="logsList.length === 0" class="text-center py-8 text-gray-600">Нет логов</div>

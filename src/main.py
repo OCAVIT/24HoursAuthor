@@ -6,7 +6,7 @@ import random
 import signal
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -43,11 +43,25 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-start_time = time.time()
-scheduler = AsyncIOScheduler()
+# Московское время (UTC+3)
+MSK = timezone(timedelta(hours=3))
 
-# Флаг работы бота (можно остановить через дашборд)
-bot_running = True
+
+def now_msk() -> datetime:
+    """Текущее время по Москве."""
+    return datetime.now(MSK)
+
+
+def today_msk() -> date:
+    """Текущая дата по Москве."""
+    return datetime.now(MSK).date()
+
+
+start_time = time.time()
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+
+# Флаг работы бота (по умолчанию ВЫКЛЮЧЕН — включить через дашборд)
+bot_running = False
 
 # Флаг для graceful shutdown — текущие задачи завершаются, новые не запускаются
 _shutting_down = False
@@ -95,7 +109,7 @@ async def _log_action(action: str, details: str = "", order_id: int | None = Non
         "action": action,
         "details": details,
         "order_id": order_id,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": now_msk().isoformat(),
     })
 
 
@@ -264,7 +278,7 @@ async def scan_orders_job() -> None:
 
         # Проверяем дневной лимит ставок
         async with async_session() as session:
-            today_stats = await get_daily_stats(session, date.today())
+            today_stats = await get_daily_stats(session, today_msk())
         bids_today = today_stats.bids_placed if today_stats else 0
 
         if not await check_daily_bid_limit(bids_today):
@@ -288,7 +302,7 @@ async def scan_orders_job() -> None:
 
             # Перепроверяем лимит после каждой ставки
             async with async_session() as session:
-                today_stats = await get_daily_stats(session, date.today())
+                today_stats = await get_daily_stats(session, today_msk())
             bids_today = today_stats.bids_placed if today_stats else 0
             if not await check_daily_bid_limit(bids_today):
                 await _log_action("antiban", f"Лимит ставок ({MAX_DAILY_BIDS}) достигнут в процессе сканирования")
@@ -532,11 +546,11 @@ async def scan_orders_job() -> None:
                             "bid_placed",
                             bid_price=bid_price,
                             bid_comment=bid_comment,
-                            bid_placed_at=datetime.now(),
+                            bid_placed_at=now_msk(),
                         )
 
                         # Обновляем дневную статистику
-                        today = date.today()
+                        today = today_msk()
                         stats = await get_daily_stats(session, today)
                         bids_today = (stats.bids_placed if stats else 0) + 1
                         await upsert_daily_stats(session, today, bids_placed=bids_today)
@@ -785,7 +799,7 @@ async def process_accepted_orders_job() -> None:
                 delay_min = _calculate_delivery_delay(
                     order.work_type, order.pages_max or order.pages_min,
                 )
-                deliver_after = datetime.now() + timedelta(minutes=delay_min)
+                deliver_after = now_msk() + timedelta(minutes=delay_min)
                 async with async_session() as session:
                     await update_order_status(
                         session, order.id, "ready",
@@ -838,8 +852,11 @@ async def process_accepted_orders_job() -> None:
                 if deliver_after_str:
                     try:
                         deliver_after = datetime.fromisoformat(deliver_after_str)
-                        if datetime.now() < deliver_after:
-                            remaining = (deliver_after - datetime.now()).total_seconds() / 60
+                        current = now_msk()
+                        # Сравниваем naive vs aware — при необходимости убираем tzinfo
+                        cmp_now = current.replace(tzinfo=None) if deliver_after.tzinfo is None else current
+                        if cmp_now < deliver_after:
+                            remaining = (deliver_after - cmp_now).total_seconds() / 60
                             logger.debug(
                                 "Заказ %s: доставка через ~%.0f мин",
                                 order.avtor24_id, remaining,
@@ -886,7 +903,7 @@ async def process_accepted_orders_job() -> None:
                             is_auto_reply=True,
                         )
 
-                        today = date.today()
+                        today = today_msk()
                         stats = await get_daily_stats(session, today)
                         await upsert_daily_stats(
                             session,
@@ -1172,7 +1189,9 @@ async def _maybe_send_proactive_message(
             return  # Не знаем когда принят — подождём следующего цикла
         if isinstance(updated_at, str):
             updated_at = datetime.fromisoformat(updated_at)
-        elapsed = (datetime.now() - updated_at).total_seconds()
+        current = now_msk()
+        cmp_now = current.replace(tzinfo=None) if (updated_at and not getattr(updated_at, 'tzinfo', None)) else current
+        elapsed = (cmp_now - updated_at).total_seconds()
         if elapsed < PROACTIVE_MSG_DELAY_SEC:
             return  # Рано ещё
 
@@ -1532,7 +1551,7 @@ async def chat_responder_job() -> None:
 async def daily_summary_job() -> None:
     """Сформировать и отправить ежедневную сводку."""
     try:
-        today = date.today()
+        today = today_msk()
 
         async with async_session() as session:
             stats = await get_daily_stats(session, today)
@@ -1672,7 +1691,7 @@ async def check_accepted_bids_job() -> None:
                         await update_order_status(session, order.id, "accepted")
 
                 async with async_session() as session:
-                    today = date.today()
+                    today = today_msk()
                     stats = await get_daily_stats(session, today)
                     await upsert_daily_stats(
                         session, today,
@@ -1789,7 +1808,17 @@ async def lifespan(app: FastAPI):
 
     scheduler.start()
     logger.info("APScheduler запущен с %d задачами", len(scheduler.get_jobs()))
-    await _log_action("system", "Бот запущен, планировщик активирован")
+
+    # Бот по умолчанию выключен — ставим планировщик на паузу
+    if not bot_running:
+        try:
+            scheduler.pause()
+        except Exception:
+            pass
+        logger.info("Бот запущен в ВЫКЛЮЧЕННОМ состоянии (включите через дашборд)")
+        await _log_action("system", "Бот запущен в выключенном состоянии — включите через дашборд")
+    else:
+        await _log_action("system", "Бот запущен, планировщик активирован")
 
     yield
 

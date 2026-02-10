@@ -337,6 +337,11 @@ function dashboard() {
             }
         },
 
+        get filteredLogs() {
+            if (!this.logFilter) return this.logsList;
+            return this.logsList.filter(l => l.action === this.logFilter);
+        },
+
         scrollLogTerminal() {
             if (!this.logAutoScroll) return;
             const el = document.getElementById('logTerminal');
@@ -440,6 +445,11 @@ function dashboard() {
 
             /* Logs WS */
             this._connectOneWS(`${base}/ws/logs`, 'logs', (data) => {
+                /* Normalize: WS sends 'timestamp', API returns 'created_at' */
+                if (data.timestamp && !data.created_at) {
+                    data.created_at = data.timestamp;
+                }
+                if (!data.id) data.id = 'ws_' + Date.now() + '_' + Math.random();
                 this.logsList.push(data);
                 /* Keep only last 500 */
                 if (this.logsList.length > 500) this.logsList.splice(0, this.logsList.length - 500);
@@ -519,7 +529,7 @@ function dashboard() {
             if (!d) return '';
             try {
                 const dt = new Date(d);
-                return dt.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+                return dt.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', timeZone: 'Europe/Moscow' });
             } catch { return d; }
         },
 
@@ -527,7 +537,16 @@ function dashboard() {
             if (!d) return '';
             try {
                 const dt = new Date(d);
-                return dt.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                /* Показываем время в МСК (UTC+3) */
+                return dt.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Europe/Moscow' });
+            } catch { return d; }
+        },
+
+        formatDateTimeMsk(d) {
+            if (!d) return '';
+            try {
+                const dt = new Date(d);
+                return dt.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Moscow' });
             } catch { return d; }
         },
 
@@ -536,7 +555,9 @@ function dashboard() {
             try {
                 const now = Date.now();
                 const dt = new Date(d).getTime();
+                if (isNaN(dt)) return '';
                 const diff = Math.floor((now - dt) / 1000);
+                if (diff < 0) return 'только что'; /* Future timestamp */
                 if (diff < 60) return 'только что';
                 if (diff < 3600) return Math.floor(diff / 60) + ' мин';
                 if (diff < 86400) return Math.floor(diff / 3600) + ' ч';

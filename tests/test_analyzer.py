@@ -165,26 +165,26 @@ class TestPriceCalculator:
     """Тесты расчёта цен."""
 
     def test_budget_based_pricing(self):
-        """Цена на основе бюджета заказчика: 85-95% от бюджета."""
+        """Цена на основе бюджета заказчика: 60-75% от бюджета (агрессивная стратегия)."""
         order = _make_order(budget="3000₽", budget_rub=3000, average_bid=None)
         for _ in range(20):
             price = calculate_price(order)
-            assert 2550 <= price <= 2850  # 85-95% от 3000
+            assert 1800 <= price <= 2250  # 60-75% от 3000
 
     def test_combined_budget_and_avg_pricing(self):
-        """Если есть и бюджет и средняя ставка — взвешенное среднее."""
+        """Если есть и бюджет и средняя ставка — взвешенное среднее (агрессивная стратегия)."""
         order = _make_order(budget="3000₽", budget_rub=3000, average_bid=2000)
         for _ in range(20):
             price = calculate_price(order)
-            # blended = 3000*0.6 + 2000*0.4 = 2600, then 85-95% = 2210-2470
-            assert 2200 <= price <= 2500
+            # blended = 3000*0.6 + 2000*0.4 = 2600, then 60-75% = 1560-1950
+            assert 1560 <= price <= 1950
 
     def test_average_bid_based_pricing(self):
-        """Если нет бюджета — используем среднюю ставку."""
+        """Если нет бюджета — используем среднюю ставку (агрессивная стратегия)."""
         order = _make_order(budget=None, budget_rub=None, average_bid=2000)
         for _ in range(20):
             price = calculate_price(order)
-            assert 1700 <= price <= 1960  # 85-98% от 2000
+            assert 1300 <= price <= 1600  # 65-80% от 2000
 
     def test_formula_based_pricing(self):
         """Если нет ни бюджета ни ставок — формула."""

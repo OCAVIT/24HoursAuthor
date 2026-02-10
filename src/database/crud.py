@@ -1,9 +1,16 @@
 """CRUD операции для работы с БД."""
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from sqlalchemy import select, update, func, desc, asc
 from sqlalchemy.ext.asyncio import AsyncSession
+
+# Московское время (UTC+3)
+_MSK = timezone(timedelta(hours=3))
+
+
+def _today_msk() -> date:
+    return datetime.now(_MSK).date()
 
 from src.database.models import (
     Order, Message, ActionLog, DailyStat,
@@ -302,12 +309,12 @@ async def get_orders_paginated(
 
 async def get_dashboard_stats(session: AsyncSession) -> dict:
     """Получить сводную статистику для виджетов дашборда."""
-    today = date.today()
+    today = _today_msk()
 
-    # Активные заказы (не завершённые и не отклонённые)
+    # Активные заказы (принятые и в работе, БЕЗ bid_placed — те в отдельном виджете)
     active_result = await session.execute(
         select(func.count(Order.id)).where(
-            Order.status.notin_(["completed", "rejected", "new", "scored"])
+            Order.status.notin_(["completed", "rejected", "new", "scored", "bid_placed"])
         )
     )
     active_count = active_result.scalar() or 0
@@ -322,7 +329,7 @@ async def get_dashboard_stats(session: AsyncSession) -> dict:
     today_stats = await get_daily_stats(session, today)
 
     # Доход за неделю
-    week_start = date.today().toordinal() - date.today().weekday()
+    week_start = _today_msk().toordinal() - _today_msk().weekday()
     week_date = date.fromordinal(week_start)
     week_result = await session.execute(
         select(func.coalesce(func.sum(DailyStat.income_rub), 0)).where(
@@ -345,9 +352,18 @@ async def get_dashboard_stats(session: AsyncSession) -> dict:
     )
     api_cost_today = today_api_result.scalar() or 0
 
+    # Всего ставок (bid_placed + accepted + далее по воронке)
+    total_bids_result = await session.execute(
+        select(func.count(Order.id)).where(
+            Order.status.notin_(["new", "scored", "rejected"])
+        )
+    )
+    total_bids = total_bids_result.scalar() or 0
+
     return {
         "active_orders": active_count,
         "bids_pending": bids_pending,
+        "bids_total": total_bids,
         "income_today": today_stats.income_rub if today_stats else 0,
         "income_week": income_week,
         "income_total": income_total,
@@ -373,11 +389,23 @@ async def get_analytics(
     daily_rows = list(ds_result.scalars().all())
 
     total_income = sum(d.income_rub or 0 for d in daily_rows)
-    total_api_cost = sum(d.api_cost_usd or 0 for d in daily_rows)
-    total_tokens = sum(d.api_tokens_used or 0 for d in daily_rows)
     total_bids = sum(d.bids_placed or 0 for d in daily_rows)
     total_accepted = sum(d.orders_accepted or 0 for d in daily_rows)
     total_delivered = sum(d.orders_delivered or 0 for d in daily_rows)
+
+    # API cost и токены — берём из ApiUsage (DailyStat не всегда обновляется)
+    api_cost_stmt = select(
+        func.coalesce(func.sum(ApiUsage.cost_usd), 0).label("cost"),
+        func.coalesce(func.sum(ApiUsage.input_tokens + ApiUsage.output_tokens), 0).label("tokens"),
+    )
+    if date_from:
+        api_cost_stmt = api_cost_stmt.where(func.date(ApiUsage.created_at) >= date_from)
+    if date_to:
+        api_cost_stmt = api_cost_stmt.where(func.date(ApiUsage.created_at) <= date_to)
+    api_cost_result = await session.execute(api_cost_stmt)
+    api_cost_row = api_cost_result.one()
+    total_api_cost = float(api_cost_row.cost or 0)
+    total_tokens = int(api_cost_row.tokens or 0)
 
     daily_data = [
         {

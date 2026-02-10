@@ -282,8 +282,8 @@ class TestOrderScanScoreBidCycle:
         from src.analyzer.price_calculator import calculate_price
         price = calculate_price(detail)
 
-        # Бюджет 2000 → ставка 85-95% = 1700-1900
-        assert 1700 <= price <= 1900
+        # Бюджет 2000 → ставка 60-75% = 1200-1500 (агрессивная стратегия)
+        assert 1200 <= price <= 1500
 
         # 5. Сохранение в БД
         db_order = await create_order(
