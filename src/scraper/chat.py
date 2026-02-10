@@ -268,7 +268,19 @@ async def get_active_chats(page: Page) -> list[str]:
     """
     try:
         home_url = f"{settings.avtor24_base_url}/home"
-        await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as nav_err:
+            if "ERR_ABORTED" in str(nav_err):
+                # SPA может перенаправить — пробуем дождаться загрузки
+                logger.debug("ERR_ABORTED на /home, ждём загрузки страницы...")
+                await asyncio.sleep(5)
+                # Проверяем, загрузилась ли страница
+                if "/login" in page.url:
+                    logger.warning("Сессия истекла, требуется повторный логин")
+                    return []
+            else:
+                raise
         await asyncio.sleep(5)
 
         order_ids = await page.evaluate("""

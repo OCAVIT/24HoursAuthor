@@ -963,7 +963,18 @@ async def check_accepted_bids_job() -> None:
 
         # Переходим на страницу наших заказов
         my_orders_url = f"{settings.avtor24_base_url}/cabinet/orders"
-        await page.goto(my_orders_url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.goto(my_orders_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as nav_err:
+            if "ERR_ABORTED" in str(nav_err):
+                # SPA может перенаправить — пробуем дождаться загрузки
+                logger.debug("ERR_ABORTED на /cabinet/orders, ждём загрузки...")
+                await asyncio.sleep(5)
+                if "/login" in page.url:
+                    logger.warning("Сессия истекла при проверке принятых заказов")
+                    return
+            else:
+                raise
         await browser_manager.short_delay()
 
         # Ищем заказы в статусе "В работе" / "Оплачен"
