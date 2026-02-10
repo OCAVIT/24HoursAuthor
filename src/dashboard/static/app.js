@@ -509,16 +509,20 @@ function dashboard() {
         },
 
         renderChart(canvasId, storeKey, type, labels, datasets, extraOpts = {}) {
+            if (typeof Chart === 'undefined') return;
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
+
+            /* Pre-check: get 2d context ourselves first */
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
 
             const parent = canvas.parentElement;
             if (!parent) return;
             const rect = parent.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) return;
 
-            /* Set explicit canvas dimensions — responsive:false mode,
-               no ResizeObserver, no async errors on x-show transitions */
+            /* Set explicit canvas dimensions (responsive:false) */
             canvas.style.width = '100%';
             canvas.style.height = '100%';
             canvas.width = Math.round(rect.width);
@@ -528,12 +532,13 @@ function dashboard() {
 
             try {
                 const isDoughnut = type === 'doughnut' || type === 'pie';
-                this[storeKey] = new Chart(canvas, {
+                this[storeKey] = new Chart(ctx, {
                     type,
                     data: { labels, datasets },
                     options: {
                         responsive: false,
                         maintainAspectRatio: false,
+                        animation: false,
                         plugins: {
                             legend: { display: isDoughnut, position: 'bottom', labels: { color: '#a1a1aa', padding: 16, font: { size: 11 } } },
                         },

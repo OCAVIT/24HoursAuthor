@@ -19,11 +19,17 @@
         }
     </script>
     <script>
-        /* Suppress Chart.js internal errors (ResizeObserver / canvas access).
-           window.onerror returning true is the most reliable way to silence them. */
-        window.onerror = function(msg) {
-            if (typeof msg === 'string' && msg.indexOf('getContext') !== -1) return true;
-        };
+        /* Suppress Chart.js internal errors. Use capture-phase listener
+           (runs first, can't be overridden by later scripts) + window.onerror */
+        (function() {
+            var suppress = function(msg) {
+                return typeof msg === 'string' && msg.indexOf('getContext') !== -1;
+            };
+            window.addEventListener('error', function(e) {
+                if (suppress(e.message)) { e.stopImmediatePropagation(); e.preventDefault(); }
+            }, true);
+            window.onerror = function(msg) { if (suppress(msg)) return true; };
+        })();
     </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <link rel="stylesheet" href="/dashboard/static/styles.css">
@@ -775,6 +781,6 @@
     </audio>
 
     <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js" defer></script>
-    <script src="/dashboard/static/app.js"></script>
+    <script src="/dashboard/static/app.js?v=5"></script>
 </body>
 </html>

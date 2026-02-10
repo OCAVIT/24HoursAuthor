@@ -500,11 +500,14 @@ async def export_csv(
 
 @router.get("/dashboard/static/{filepath:path}")
 async def serve_static(filepath: str):
-    """Отдача статических файлов (CSS, JS)."""
+    """Отдача статических файлов (CSS, JS) без кэширования."""
     file_path = os.path.join(STATIC_DIR, filepath)
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="Файл не найден")
-    return FileResponse(file_path)
+    return FileResponse(
+        file_path,
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 @router.get("/dashboard/login")
@@ -526,7 +529,10 @@ async def dashboard_index(request: Request):
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url="/dashboard/login")
     file_path = os.path.join(STATIC_DIR, "index.html")
-    return FileResponse(file_path, media_type="text/html")
+    return FileResponse(
+        file_path, media_type="text/html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 # ---------------------------------------------------------------------------
