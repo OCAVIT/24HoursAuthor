@@ -1076,6 +1076,10 @@ async def chat_responder_job() -> None:
                     if not order:
                         continue
 
+                # Пропускаем завершённые/отменённые заказы
+                if order.status in ("delivered", "completed", "rejected", "cancelled"):
+                    continue
+
                 # Получаем историю сообщений
                 await browser_manager.random_delay(min_sec=2, max_sec=5)
                 chat_messages = await _retry_async(get_messages, page, avtor24_id)

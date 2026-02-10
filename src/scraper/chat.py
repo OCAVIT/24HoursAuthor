@@ -340,16 +340,35 @@ async def _extract_visible_order_ids(page: Page) -> list[str]:
 
     ВАЖНО: Контент рендерится ВНЕ #root — ищем по document.body.
     Исключаем рекомендованные заказы (with ?from_recommended= в URL).
+    Исключаем завершённые/отменённые заказы (по бейджу OrderStageLabel).
     """
     raw: list[str] = await page.evaluate(r"""
         () => {
             const results = [];
             const seen = new Set();
+            const skipStatuses = ['завершен', 'завершён', 'отменен', 'отменён'];
             document.querySelectorAll('a[href*="/order/getoneorder/"]').forEach(a => {
                 if (a.href.includes('from_recommended')) return;
                 const match = a.href.match(/getoneorder\/(\d+)/);
                 if (!match || seen.has(match[1])) return;
                 seen.add(match[1]);
+
+                // Check for status badge on the order card
+                const card = a.closest('li, article, [class*="Card"], [class*="Item"], [class*="Chat"]');
+                const container = card || a.parentElement;
+                if (container) {
+                    let skip = false;
+                    container.querySelectorAll(
+                        '[class*="OrderStageLabel"], [class*="StageLabel"], [class*="Badge"], [class*="Status"]'
+                    ).forEach(badge => {
+                        const text = (badge.textContent || '').trim().toLowerCase();
+                        if (skipStatuses.some(s => text.includes(s))) {
+                            skip = true;
+                        }
+                    });
+                    if (skip) return;
+                }
+
                 results.push(match[1]);
             });
             return results;
