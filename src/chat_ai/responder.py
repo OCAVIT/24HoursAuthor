@@ -258,6 +258,78 @@ async def generate_clarifying_message(
     )
 
 
+async def generate_proactive_message(
+    work_type: str,
+    subject: str,
+    title: str,
+    description: str,
+    required_uniqueness: Optional[int] = None,
+    antiplagiat_system: str = "",
+) -> ChatResponse:
+    """Сгенерировать проактивное сообщение, если заказчик молчит.
+
+    Бот сам пишет первым: говорит что онлайн, готов начать работу,
+    и при необходимости уточняет недостающие детали.
+    """
+    missing_parts = []
+    if not antiplagiat_system:
+        missing_parts.append("систему антиплагиата")
+    if not required_uniqueness:
+        missing_parts.append("требуемый процент уникальности")
+
+    if missing_parts:
+        clarify_hint = (
+            f" Уточни {' и '.join(missing_parts)} — это нужно для работы."
+        )
+    else:
+        clarify_hint = ""
+
+    prompt_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты автор на платформе Автор24. Заказчик выбрал тебя исполнителем, "
+                "но ещё ничего не написал. Ты пишешь первым. "
+                "Напиши короткое дружелюбное сообщение (2-3 предложения): "
+                "поздоровайся, скажи что ты онлайн и уже приступаешь к работе. "
+                f"{clarify_hint}"
+                "Не упоминай AI, нейросети, GPT. Пиши как реальный студент-фрилансер. "
+                "Не пиши длинно. Будь лаконичным."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Заказ: {work_type} по предмету {subject}.\n"
+                f"Тема: {title}\n"
+                f"Описание: {description[:500]}"
+            ),
+        },
+    ]
+
+    result = await chat_completion(
+        messages=prompt_messages,
+        model=settings.openai_model_fast,
+        temperature=0.8,
+        max_tokens=200,
+    )
+
+    text = _sanitize_response(result["content"].strip())
+
+    logger.info(
+        "Проактивное сообщение сгенерировано: %d токенов, $%.4f",
+        result["total_tokens"], result["cost_usd"],
+    )
+
+    return ChatResponse(
+        text=text,
+        input_tokens=result["input_tokens"],
+        output_tokens=result["output_tokens"],
+        total_tokens=result["total_tokens"],
+        cost_usd=result["cost_usd"],
+    )
+
+
 async def parse_customer_answer(
     customer_text: str,
     order_context: str,

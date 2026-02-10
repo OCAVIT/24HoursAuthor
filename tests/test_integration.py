@@ -1637,3 +1637,476 @@ class TestEnsureOrderInDb:
             result = await _ensure_order_in_db(mock_page, "70004")
 
         assert result is None
+
+
+class TestAutoCancellation:
+    """Тесты автоотмены заказов при изменении условий Ассистентом."""
+
+    @pytest.mark.asyncio
+    async def test_cancels_unprofitable_order(self, int_engine, int_session):
+        """Если после изменения условий заказ нерентабелен — отменяем."""
+        from src.scraper.chat import ChatMessage
+        from src.scraper.order_detail import OrderDetail
+
+        # bid_price=100 — Эссе стоит ~12 руб API, доход = 100*0.975 = 97.5
+        # Порог: 12 * 3 = 36 руб → 97.5 >= 36, прибыльно
+        # Но мы сделаем bid_price слишком маленький: bid_price=30
+        # income = 30 * 0.975 = 29.25, threshold = 12 * 3 = 36 → НЕ прибыльно
+        order = await create_order(
+            int_session,
+            avtor24_id="80001",
+            title="Маленький эссе",
+            work_type="Эссе",
+            bid_price=30,
+            budget_rub=500,
+            description="Старое описание",
+            status="accepted",
+        )
+
+        assistant_msg = ChatMessage(
+            order_id="80001",
+            text="Условия изменены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+
+        # Новые условия — описание изменилось (триггер обновления)
+        updated_detail = OrderDetail(
+            order_id="80001",
+            title="Маленький эссе",
+            url="https://avtor24.ru/order/getoneorder/80001",
+            work_type="Эссе",
+            description="Совсем новое описание",
+            budget_rub=500,
+        )
+
+        mock_page = MagicMock()
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=updated_detail), \
+             patch("src.main._log_action", new_callable=AsyncMock) as mock_log, \
+             patch("src.main.push_notification", new_callable=AsyncMock) as mock_notif, \
+             patch("src.scraper.chat.cancel_order", new_callable=AsyncMock, return_value=True) as mock_cancel:
+
+            from src.main import _handle_assistant_messages
+            await _handle_assistant_messages(
+                mock_page, "80001", order, [assistant_msg],
+            )
+
+        # cancel_order должен быть вызван
+        mock_cancel.assert_awaited_once_with(mock_page, "80001")
+
+        # Статус обновлён на cancelled
+        int_session.expire_all()
+        updated_order = await get_order_by_avtor24_id(int_session, "80001")
+        assert updated_order.status == "cancelled"
+
+        # Уведомление об отмене отправлено (второй вызов push_notification)
+        assert mock_notif.await_count == 2  # первый = условия изменены, второй = отмена
+
+    @pytest.mark.asyncio
+    async def test_does_not_cancel_profitable_order(self, int_engine, int_session):
+        """Если заказ прибылен после изменений — не отменяем."""
+        from src.scraper.chat import ChatMessage
+        from src.scraper.order_detail import OrderDetail
+
+        # bid_price=2000, Эссе API ~12 руб
+        # income = 2000*0.975 = 1950, threshold = 12*3 = 36 → прибыльно
+        order = await create_order(
+            int_session,
+            avtor24_id="80002",
+            title="Нормальный эссе",
+            work_type="Эссе",
+            bid_price=2000,
+            budget_rub=2500,
+            description="Старое описание",
+            status="accepted",
+        )
+
+        assistant_msg = ChatMessage(
+            order_id="80002",
+            text="Условия изменены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+
+        updated_detail = OrderDetail(
+            order_id="80002",
+            title="Нормальный эссе",
+            url="https://avtor24.ru/order/getoneorder/80002",
+            work_type="Эссе",
+            description="Обновлённое описание",
+            budget_rub=2500,
+        )
+
+        mock_page = MagicMock()
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=updated_detail), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock), \
+             patch("src.scraper.chat.cancel_order", new_callable=AsyncMock) as mock_cancel:
+
+            from src.main import _handle_assistant_messages
+            await _handle_assistant_messages(
+                mock_page, "80002", order, [assistant_msg],
+            )
+
+        # cancel_order НЕ вызван
+        mock_cancel.assert_not_awaited()
+
+        # Статус остался accepted
+        int_session.expire_all()
+        order_check = await get_order_by_avtor24_id(int_session, "80002")
+        assert order_check.status == "accepted"
+
+    @pytest.mark.asyncio
+    async def test_no_cancel_when_no_bid_price(self, int_engine, int_session):
+        """Если bid_price не задан — пропускаем проверку прибыльности."""
+        from src.scraper.chat import ChatMessage
+        from src.scraper.order_detail import OrderDetail
+
+        order = await create_order(
+            int_session,
+            avtor24_id="80003",
+            title="Без ставки",
+            work_type="Реферат",
+            bid_price=None,
+            description="Описание",
+            status="accepted",
+        )
+
+        assistant_msg = ChatMessage(
+            order_id="80003",
+            text="Условия изменены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+
+        updated_detail = OrderDetail(
+            order_id="80003",
+            title="Без ставки",
+            url="https://avtor24.ru/order/getoneorder/80003",
+            work_type="Реферат",
+            description="Новое описание",
+        )
+
+        mock_page = MagicMock()
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=updated_detail), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock), \
+             patch("src.scraper.chat.cancel_order", new_callable=AsyncMock) as mock_cancel:
+
+            from src.main import _handle_assistant_messages
+            await _handle_assistant_messages(
+                mock_page, "80003", order, [assistant_msg],
+            )
+
+        # cancel НЕ вызван (нет bid_price)
+        mock_cancel.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancel_failure_logs_error(self, int_engine, int_session):
+        """Если cancel_order вернул False — логируем ошибку, статус не меняем."""
+        from src.scraper.chat import ChatMessage
+        from src.scraper.order_detail import OrderDetail
+
+        order = await create_order(
+            int_session,
+            avtor24_id="80004",
+            title="Нерентабельный",
+            work_type="Эссе",
+            bid_price=30,
+            description="Описание",
+            status="accepted",
+        )
+
+        assistant_msg = ChatMessage(
+            order_id="80004",
+            text="Условия изменены",
+            is_incoming=True,
+            sender_name="Ассистент",
+        )
+
+        updated_detail = OrderDetail(
+            order_id="80004",
+            title="Нерентабельный",
+            url="https://avtor24.ru/order/getoneorder/80004",
+            work_type="Эссе",
+            description="Новое описание",
+        )
+
+        mock_page = MagicMock()
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", new_callable=AsyncMock, return_value=updated_detail), \
+             patch("src.main._log_action", new_callable=AsyncMock) as mock_log, \
+             patch("src.main.push_notification", new_callable=AsyncMock), \
+             patch("src.scraper.chat.cancel_order", new_callable=AsyncMock, return_value=False) as mock_cancel:
+
+            from src.main import _handle_assistant_messages
+            await _handle_assistant_messages(
+                mock_page, "80004", order, [assistant_msg],
+            )
+
+        # cancel_order вызван, но вернул False
+        mock_cancel.assert_awaited_once()
+
+        # Статус НЕ изменился (остался accepted)
+        int_session.expire_all()
+        order_check = await get_order_by_avtor24_id(int_session, "80004")
+        assert order_check.status == "accepted"
+
+        # Логирование ошибки о неудачной отмене
+        log_calls = [call.args for call in mock_log.await_args_list]
+        error_logged = any("Не удалось отменить" in str(args) for args in log_calls)
+        assert error_logged, f"Expected error log about failed cancel, got: {log_calls}"
+
+
+class TestProactiveMessage:
+    """Тесты проактивного сообщения (бот пишет первым, когда заказчик молчит)."""
+
+    @pytest.mark.asyncio
+    async def test_sends_proactive_when_customer_silent(self, int_engine, int_session):
+        """Отправляет проактивное сообщение, если заказчик молчит 5+ мин."""
+        from src.chat_ai.responder import ChatResponse
+        from datetime import timedelta
+
+        # Заказ принят 10 минут назад
+        order = await create_order(
+            int_session,
+            avtor24_id="90001",
+            title="Эссе по философии",
+            work_type="Эссе",
+            subject="Философия",
+            description="Описание",
+            bid_price=1500,
+            status="accepted",
+        )
+        # Имитируем updated_at = 10 минут назад
+        from sqlalchemy import update as sa_update
+        async with async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)() as s:
+            await s.execute(
+                sa_update(Order).where(Order.id == order.id).values(
+                    updated_at=datetime.now() - timedelta(minutes=10)
+                )
+            )
+            await s.commit()
+
+        # Перечитаем заказ
+        int_session.expire_all()
+        order = await get_order_by_avtor24_id(int_session, "90001")
+
+        mock_page = MagicMock()
+        mock_bm = MagicMock()
+        mock_bm.random_delay = AsyncMock()
+
+        mock_send = AsyncMock(return_value=True)
+        proactive_response = ChatResponse(
+            text="Добрый день! Я онлайн, приступаю к работе.",
+            input_tokens=50, output_tokens=20, total_tokens=70, cost_usd=0.001,
+        )
+        mock_generate = AsyncMock(return_value=proactive_response)
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        # Нет сообщений в чате (пустой чат = только системные)
+        chat_messages = []
+
+        async def _retry_passthrough(fn, *a, **kw):
+            return await fn(*a, **kw)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._retry_async", side_effect=_retry_passthrough), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock):
+
+            from src.main import _maybe_send_proactive_message
+            await _maybe_send_proactive_message(
+                mock_page, "90001", order, chat_messages,
+                mock_bm, mock_send, mock_generate,
+            )
+
+        # Проактивное сообщение сгенерировано и отправлено
+        mock_generate.assert_awaited_once()
+        mock_send.assert_awaited_once()
+
+        # Сообщение сохранено в БД
+        order_db_id = order.id
+        int_session.expire_all()
+        db_msgs = await get_messages_for_order(int_session, order_db_id)
+        assert len(db_msgs) == 1
+        assert db_msgs[0].direction == "outgoing"
+        assert "Добрый день" in db_msgs[0].text
+
+    @pytest.mark.asyncio
+    async def test_skips_if_already_messaged(self, int_engine, int_session):
+        """Не отправляет, если мы уже писали в этот чат."""
+        from datetime import timedelta
+
+        order = await create_order(
+            int_session,
+            avtor24_id="90002",
+            title="Реферат",
+            work_type="Реферат",
+            bid_price=1000,
+            status="accepted",
+        )
+        # Имитируем updated_at = 10 минут назад
+        from sqlalchemy import update as sa_update
+        async with async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)() as s:
+            await s.execute(
+                sa_update(Order).where(Order.id == order.id).values(
+                    updated_at=datetime.now() - timedelta(minutes=10)
+                )
+            )
+            await s.commit()
+
+        # Уже есть исходящее сообщение
+        await create_message(int_session, order_id=order.id, direction="outgoing", text="Привет!")
+
+        int_session.expire_all()
+        order = await get_order_by_avtor24_id(int_session, "90002")
+
+        mock_page = MagicMock()
+        mock_bm = MagicMock()
+        mock_bm.random_delay = AsyncMock()
+        mock_send = AsyncMock()
+        mock_generate = AsyncMock()
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock):
+
+            from src.main import _maybe_send_proactive_message
+            await _maybe_send_proactive_message(
+                mock_page, "90002", order, [],
+                mock_bm, mock_send, mock_generate,
+            )
+
+        # НЕ сгенерировано, НЕ отправлено
+        mock_generate.assert_not_awaited()
+        mock_send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_if_too_early(self, int_engine, int_session):
+        """Не отправляет, если прошло меньше 5 минут."""
+        order = await create_order(
+            int_session,
+            avtor24_id="90003",
+            title="Эссе",
+            work_type="Эссе",
+            bid_price=500,
+            status="accepted",
+        )
+        # Явно устанавливаем updated_at = сейчас (только что принят)
+        from sqlalchemy import update as sa_update
+        async with async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)() as s:
+            await s.execute(
+                sa_update(Order).where(Order.id == order.id).values(
+                    updated_at=datetime.now()
+                )
+            )
+            await s.commit()
+        int_session.expire_all()
+        order = await get_order_by_avtor24_id(int_session, "90003")
+
+        mock_page = MagicMock()
+        mock_bm = MagicMock()
+        mock_bm.random_delay = AsyncMock()
+        mock_send = AsyncMock()
+        mock_generate = AsyncMock()
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock):
+
+            from src.main import _maybe_send_proactive_message
+            await _maybe_send_proactive_message(
+                mock_page, "90003", order, [],
+                mock_bm, mock_send, mock_generate,
+            )
+
+        # НЕ отправлено (рано)
+        mock_generate.assert_not_awaited()
+        mock_send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_if_not_accepted(self, int_engine, int_session):
+        """Не отправляет для заказов не в статусе accepted."""
+        from datetime import timedelta
+
+        order = await create_order(
+            int_session,
+            avtor24_id="90004",
+            title="Курсовая",
+            work_type="Курсовая работа",
+            bid_price=3000,
+            status="generating",  # уже генерируется
+        )
+        from sqlalchemy import update as sa_update
+        async with async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)() as s:
+            await s.execute(
+                sa_update(Order).where(Order.id == order.id).values(
+                    updated_at=datetime.now() - timedelta(minutes=10)
+                )
+            )
+            await s.commit()
+
+        int_session.expire_all()
+        order = await get_order_by_avtor24_id(int_session, "90004")
+
+        mock_page = MagicMock()
+        mock_bm = MagicMock()
+        mock_bm.random_delay = AsyncMock()
+        mock_send = AsyncMock()
+        mock_generate = AsyncMock()
+
+        factory = async_sessionmaker(int_engine, class_=AsyncSession, expire_on_commit=False)
+
+        with patch("src.main.async_session", factory), \
+             patch("src.main._log_action", new_callable=AsyncMock), \
+             patch("src.main.push_notification", new_callable=AsyncMock):
+
+            from src.main import _maybe_send_proactive_message
+            await _maybe_send_proactive_message(
+                mock_page, "90004", order, [],
+                mock_bm, mock_send, mock_generate,
+            )
+
+        # НЕ отправлено (статус != accepted)
+        mock_generate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_error_does_not_crash(self, int_session):
+        """Ошибка в проактивном сообщении не роняет бота."""
+        order = await create_order(
+            int_session,
+            avtor24_id="90005",
+            title="Тест",
+            status="accepted",
+        )
+
+        mock_page = MagicMock()
+        mock_bm = MagicMock()
+        mock_bm.random_delay = AsyncMock()
+        mock_send = AsyncMock()
+        mock_generate = AsyncMock(side_effect=Exception("API error"))
+
+        with patch("src.main.async_session", side_effect=Exception("DB down")):
+            from src.main import _maybe_send_proactive_message
+            # Не должен бросить исключение
+            await _maybe_send_proactive_message(
+                mock_page, "90005", order, [],
+                mock_bm, mock_send, mock_generate,
+            )

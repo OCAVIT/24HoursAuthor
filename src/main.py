@@ -806,7 +806,9 @@ async def _handle_assistant_messages(
     """
     from src.scraper.order_detail import fetch_order_detail
     from src.scraper.browser import browser_manager
+    from src.scraper.chat import cancel_order
     from src.database.crud import update_order_fields
+    from src.analyzer.price_calculator import is_profitable
 
     try:
         await _log_action(
@@ -865,6 +867,47 @@ async def _handle_assistant_messages(
                     },
                     order_id=order.id,
                 )
+
+            # --- Проверка прибыльности после изменения условий ---
+            bid_price = order.bid_price
+            work_type = order.work_type or "Другое"
+            if bid_price and not is_profitable(bid_price, work_type):
+                await _log_action(
+                    "chat",
+                    f"Заказ #{avtor24_id} стал нерентабельным после изменения условий "
+                    f"(bid={bid_price}, work_type={work_type}), отменяем",
+                    order_id=order.id,
+                )
+                cancelled = await cancel_order(page, avtor24_id)
+                if cancelled:
+                    async with async_session() as session:
+                        await update_order_status(session, order.id, "cancelled")
+                    async with async_session() as session:
+                        await push_notification(
+                            session,
+                            type="error",
+                            title=f"Заказ #{avtor24_id} отменён (нерентабельно)",
+                            body={
+                                "order_id": avtor24_id,
+                                "error": (
+                                    f"Условия изменены Ассистентом ({changes_str}), "
+                                    f"заказ стал нерентабельным — автоотмена"
+                                ),
+                                "requires_attention": False,
+                            },
+                            order_id=order.id,
+                        )
+                    await _log_action(
+                        "cancel",
+                        f"Заказ #{avtor24_id} автоотменён: нерентабельно после изменения условий",
+                        order_id=order.id,
+                    )
+                else:
+                    await _log_action(
+                        "error",
+                        f"Не удалось отменить нерентабельный заказ #{avtor24_id} (кнопка не найдена?)",
+                        order_id=order.id,
+                    )
         else:
             await _log_action(
                 "chat",
@@ -882,6 +925,115 @@ async def _handle_assistant_messages(
 
 
 # ---------------------------------------------------------------------------
+# Проактивное сообщение (бот пишет первым)
+# ---------------------------------------------------------------------------
+
+# Минимум секунд с момента принятия заказа, прежде чем бот пишет первым
+PROACTIVE_MSG_DELAY_SEC = 5 * 60  # 5 минут
+
+
+async def _maybe_send_proactive_message(
+    page,
+    avtor24_id: str,
+    order,
+    chat_messages: list,
+    browser_manager,
+    send_message_fn,
+    generate_proactive_fn,
+) -> None:
+    """Отправить проактивное сообщение, если заказчик молчит после принятия.
+
+    Условия:
+    1. Статус заказа = accepted (ещё не начали генерацию)
+    2. Нет наших исходящих сообщений в БД (не писали ещё)
+    3. Прошло >= PROACTIVE_MSG_DELAY_SEC с момента принятия
+    """
+    try:
+        # Только для accepted заказов
+        if order.status != "accepted":
+            return
+
+        # Проверяем: мы уже писали в этот чат?
+        async with async_session() as session:
+            db_messages = await get_messages_for_order(session, order.id)
+        has_outgoing = any(m.direction == "outgoing" for m in db_messages)
+        if has_outgoing:
+            return  # Уже писали — не нужно
+
+        # Проверяем: прошло ли 5 минут с момента принятия?
+        updated_at = order.updated_at
+        if updated_at is None:
+            return  # Не знаем когда принят — подождём следующего цикла
+        if isinstance(updated_at, str):
+            updated_at = datetime.fromisoformat(updated_at)
+        elapsed = (datetime.now() - updated_at).total_seconds()
+        if elapsed < PROACTIVE_MSG_DELAY_SEC:
+            return  # Рано ещё
+
+        # Генерируем проактивное сообщение
+        proactive = await generate_proactive_fn(
+            work_type=order.work_type or "",
+            subject=order.subject or "",
+            title=order.title or "",
+            description=order.description or order.title or "",
+            required_uniqueness=order.required_uniqueness,
+            antiplagiat_system=order.antiplagiat_system or "",
+        )
+
+        await browser_manager.random_delay(min_sec=3, max_sec=8)
+        send_ok = await _retry_async(send_message_fn, page, avtor24_id, proactive.text)
+
+        if send_ok:
+            async with async_session() as session:
+                await create_message(
+                    session,
+                    order_id=order.id,
+                    direction="outgoing",
+                    text=proactive.text,
+                    is_auto_reply=True,
+                )
+
+                await track_api_usage(
+                    session,
+                    model=settings.openai_model_fast,
+                    purpose="chat",
+                    input_tokens=proactive.input_tokens,
+                    output_tokens=proactive.output_tokens,
+                    cost_usd=proactive.cost_usd,
+                    order_id=order.id,
+                )
+
+                await push_notification(
+                    session,
+                    type="new_message",
+                    title=f"Проактивное сообщение: заказ #{avtor24_id}",
+                    body={
+                        "order_id": avtor24_id,
+                        "customer_message": "(заказчик молчит)",
+                        "auto_reply": proactive.text,
+                        "auto_replied": True,
+                    },
+                    order_id=order.id,
+                )
+
+            await _log_action(
+                "chat",
+                f"Проактивное сообщение отправлено в заказ #{avtor24_id}: "
+                f"\"{proactive.text[:100]}\"",
+                order_id=order.id,
+            )
+        else:
+            await _log_action(
+                "error",
+                f"Не удалось отправить проактивное сообщение в #{avtor24_id}",
+                order_id=order.id,
+            )
+
+    except Exception as e:
+        logger.warning("Ошибка проактивного сообщения для %s: %s", avtor24_id, e)
+
+
+# ---------------------------------------------------------------------------
 # Задача 3: Чат-респондер
 # ---------------------------------------------------------------------------
 
@@ -896,7 +1048,7 @@ async def chat_responder_job() -> None:
     from src.scraper.auth import login
     from src.scraper.chat import get_active_chats, get_messages, send_message, download_chat_files
     from src.scraper.browser import browser_manager
-    from src.chat_ai.responder import generate_response, parse_customer_answer
+    from src.chat_ai.responder import generate_response, parse_customer_answer, generate_proactive_message
     from src.database.crud import update_order_fields
 
     await _track_task()
@@ -946,8 +1098,16 @@ async def chat_responder_job() -> None:
                 last_msg = chat_messages[-1]
                 if last_msg.is_assistant:
                     continue  # Ассистент — не отвечаем
+
                 if not last_msg.is_incoming:
-                    continue  # Последнее — наше, ответ не нужен
+                    # Последнее сообщение — наше или системное.
+                    # Проверяем: может, нужно проактивно написать первым?
+                    await _maybe_send_proactive_message(
+                        page, avtor24_id, order, chat_messages,
+                        browser_manager, send_message,
+                        generate_proactive_message,
+                    )
+                    continue
 
                 # Сохраняем входящее сообщение
                 async with async_session() as session:

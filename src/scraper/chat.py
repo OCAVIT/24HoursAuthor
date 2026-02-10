@@ -620,6 +620,61 @@ async def _dismiss_any_overlay(page: Page) -> None:
         pass
 
 
+async def cancel_order(page: Page, order_id: str) -> bool:
+    """Отменить заказ — нажать кнопку «Отменить» на странице заказа.
+
+    После нажатия появляется модальное окно подтверждения —
+    нужно подтвердить отмену.
+
+    Returns True если отмена прошла успешно.
+    """
+    try:
+        await _ensure_order_page(page, order_id)
+        await asyncio.sleep(2)
+
+        # Ищем кнопку "Отменить" / "Отказаться от заказа"
+        cancel_btn = page.locator(
+            'button:has-text("Отменить"), '
+            'button:has-text("Отказаться"), '
+            'button:has-text("Отказаться от заказа")'
+        )
+        if await cancel_btn.count() == 0:
+            logger.warning("Кнопка 'Отменить' не найдена для заказа %s", order_id)
+            return False
+
+        # Используем force=True — оверлеи могут блокировать клик
+        await cancel_btn.first.click(force=True)
+        await asyncio.sleep(2)
+
+        # Подтверждение в модальном окне
+        modal_confirm = page.locator(
+            '[data-testid*="alertModal"] button:has-text("Подтвердить"), '
+            '[data-testid*="alertModal"] button:has-text("Да"), '
+            '[class*="Modal"] button:has-text("Подтвердить"), '
+            '[class*="Modal"] button:has-text("Да")'
+        )
+        if await modal_confirm.count() > 0:
+            await modal_confirm.first.click(force=True)
+            logger.info("Подтверждена отмена заказа %s в модалке", order_id)
+            await asyncio.sleep(3)
+        else:
+            # Fallback: ищем любую кнопку подтверждения
+            any_confirm = page.locator('button:has-text("Подтвердить"), button:has-text("Да")')
+            count = await any_confirm.count()
+            if count > 0:
+                await any_confirm.first.click(force=True)
+                await asyncio.sleep(3)
+
+        await _dismiss_any_overlay(page)
+
+        logger.info("Заказ %s отменён (нажата 'Отменить')", order_id)
+        return True
+
+    except Exception as e:
+        logger.error("Ошибка отмены заказа %s: %s", order_id, e)
+        return False
+
+
 async def download_chat_files(page: Page, order_id: str, file_urls: list[str]) -> list[str]:
     """Скачать файлы из чата (прикреплённые заказчиком).
 

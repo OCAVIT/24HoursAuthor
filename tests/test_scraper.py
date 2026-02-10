@@ -14,7 +14,7 @@ from src.scraper.orders import parse_order_cards, OrderSummary, _extract_number
 from src.scraper.order_detail import fetch_order_detail, OrderDetail, _extract_int, _extract_float
 from src.scraper.bidder import place_bid
 from src.scraper.chat import (
-    get_messages, send_message, ChatMessage,
+    get_messages, send_message, ChatMessage, cancel_order,
     get_accepted_order_ids, get_active_chats,
     _navigate_home, _extract_order_ids_from_section,
 )
@@ -1251,3 +1251,144 @@ class TestSessionManagement:
         bm = BrowserManager()
         # Нет контекста — save_cookies ничего не делает
         await bm.save_cookies()
+
+
+# ===== Тесты cancel_order =====
+
+class TestCancelOrder:
+    """Тесты отмены заказа через cancel_order()."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_success(self):
+        """Успешная отмена: кнопка найдена, модалка подтверждена."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/order/getoneorder/999"
+        page.goto = AsyncMock()
+
+        # Кнопка "Отменить" найдена
+        cancel_btn = MagicMock()
+        cancel_btn.count = AsyncMock(return_value=1)
+        cancel_btn.first = MagicMock()
+        cancel_btn.first.click = AsyncMock()
+
+        # Модалка подтверждения найдена
+        modal_btn = MagicMock()
+        modal_btn.count = AsyncMock(return_value=1)
+        modal_btn.first = MagicMock()
+        modal_btn.first.click = AsyncMock()
+
+        # Оверлей
+        overlay = MagicMock()
+        overlay.count = AsyncMock(return_value=0)
+
+        def locator_router(selector):
+            if "Отменить" in selector or "Отказаться" in selector:
+                return cancel_btn
+            if "alertModal" in selector or "Modal" in selector:
+                return modal_btn
+            if "Overlay" in selector:
+                return overlay
+            m = MagicMock()
+            m.count = AsyncMock(return_value=0)
+            return m
+
+        page.locator = MagicMock(side_effect=locator_router)
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+
+        with patch("src.scraper.chat.asyncio.sleep", new_callable=AsyncMock):
+            result = await cancel_order(page, "999")
+
+        assert result is True
+        cancel_btn.first.click.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_button_not_found(self):
+        """Кнопка 'Отменить' не найдена — возвращает False."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/order/getoneorder/888"
+        page.goto = AsyncMock()
+
+        # Кнопка не найдена
+        cancel_btn = MagicMock()
+        cancel_btn.count = AsyncMock(return_value=0)
+
+        overlay = MagicMock()
+        overlay.count = AsyncMock(return_value=0)
+
+        def locator_router(selector):
+            if "Отменить" in selector or "Отказаться" in selector:
+                return cancel_btn
+            if "Overlay" in selector:
+                return overlay
+            m = MagicMock()
+            m.count = AsyncMock(return_value=0)
+            return m
+
+        page.locator = MagicMock(side_effect=locator_router)
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+
+        with patch("src.scraper.chat.asyncio.sleep", new_callable=AsyncMock):
+            result = await cancel_order(page, "888")
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_exception_returns_false(self):
+        """Исключение при отмене — не падает, возвращает False."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/order/getoneorder/777"
+        page.goto = AsyncMock(side_effect=Exception("Navigation error"))
+
+        with patch("src.scraper.chat.asyncio.sleep", new_callable=AsyncMock):
+            result = await cancel_order(page, "777")
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_fallback_confirm(self):
+        """Если alertModal не найден — ищет любую кнопку подтверждения."""
+        page = MagicMock()
+        page.url = "https://avtor24.ru/order/getoneorder/666"
+        page.goto = AsyncMock()
+
+        cancel_btn = MagicMock()
+        cancel_btn.count = AsyncMock(return_value=1)
+        cancel_btn.first = MagicMock()
+        cancel_btn.first.click = AsyncMock()
+
+        # Модалка НЕ найдена
+        modal_btn = MagicMock()
+        modal_btn.count = AsyncMock(return_value=0)
+
+        # Fallback — любая кнопка "Подтвердить"/"Да"
+        fallback_btn = MagicMock()
+        fallback_btn.count = AsyncMock(return_value=1)
+        fallback_btn.first = MagicMock()
+        fallback_btn.first.click = AsyncMock()
+
+        overlay = MagicMock()
+        overlay.count = AsyncMock(return_value=0)
+
+        def locator_router(selector):
+            if "Отменить" in selector or "Отказаться" in selector:
+                return cancel_btn
+            if "alertModal" in selector:
+                return modal_btn
+            if "Подтвердить" in selector and "Modal" not in selector and "alertModal" not in selector:
+                return fallback_btn
+            if "Overlay" in selector:
+                return overlay
+            m = MagicMock()
+            m.count = AsyncMock(return_value=0)
+            return m
+
+        page.locator = MagicMock(side_effect=locator_router)
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock()
+
+        with patch("src.scraper.chat.asyncio.sleep", new_callable=AsyncMock):
+            result = await cancel_order(page, "666")
+
+        assert result is True
