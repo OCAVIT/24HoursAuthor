@@ -172,8 +172,8 @@ async def scan_orders_job() -> None:
         await _log_action("scan", f"Найдено {len(order_summaries)} заказов")
 
         for summary in order_summaries:
-            # Проверяем бан и shutdown на каждой итерации
-            if is_banned() or _shutting_down:
+            # Проверяем бан, shutdown и bot_running на каждой итерации
+            if is_banned() or _shutting_down or not bot_running:
                 break
 
             # Перепроверяем лимит после каждой ставки
@@ -429,39 +429,37 @@ async def scan_orders_job() -> None:
                             order_id=db_order.id,
                         )
 
-                    # Уточняющее сообщение в чат после ставки
+                    # Приветственное сообщение в чат после ставки
                     try:
-                        from src.chat_ai.responder import generate_clarifying_message
+                        from src.chat_ai.responder import generate_greeting_message
                         from src.scraper.chat import send_message as chat_send_message
 
                         await browser_manager.random_delay(min_sec=3, max_sec=8)
-                        clarify_msg = await generate_clarifying_message(
+                        greeting_msg = await generate_greeting_message(
                             work_type=detail.work_type,
                             subject=detail.subject,
                             title=detail.title,
                             description=detail.description,
-                            required_uniqueness=detail.required_uniqueness,
-                            antiplagiat_system=detail.antiplagiat_system,
                             bid_price=bid_price,
                         )
-                        if clarify_msg:
-                            send_ok = await chat_send_message(page, summary.order_id, clarify_msg.text)
+                        if greeting_msg:
+                            send_ok = await chat_send_message(page, summary.order_id, greeting_msg.text)
                             if send_ok:
                                 async with async_session() as session:
                                     await create_message(
                                         session,
                                         order_id=db_order.id,
                                         direction="outgoing",
-                                        text=clarify_msg.text,
+                                        text=greeting_msg.text,
                                         is_auto_reply=True,
                                     )
                                 await _log_action(
                                     "chat",
-                                    f"Уточняющее сообщение отправлено: \"{clarify_msg.text[:100]}\"",
+                                    f"Приветственное сообщение отправлено: \"{greeting_msg.text[:100]}\"",
                                     order_id=db_order.id,
                                 )
                     except Exception as e:
-                        logger.warning("Ошибка отправки уточняющего сообщения: %s", e)
+                        logger.warning("Ошибка отправки приветственного сообщения: %s", e)
 
                 else:
                     await _log_action(
@@ -523,6 +521,8 @@ async def process_accepted_orders_job() -> None:
         page = await _retry_async(login)
 
         for order in accepted_orders:
+            if _shutting_down or not bot_running:
+                break
             try:
                 await _log_action(
                     "generate",
@@ -730,7 +730,7 @@ async def chat_responder_job() -> None:
         return
 
     from src.scraper.auth import login
-    from src.scraper.chat import get_active_chats, get_messages, send_message
+    from src.scraper.chat import get_active_chats, get_messages, send_message, download_chat_files
     from src.scraper.browser import browser_manager
     from src.chat_ai.responder import generate_response, parse_customer_answer
     from src.database.crud import update_order_fields
@@ -746,6 +746,8 @@ async def chat_responder_job() -> None:
         await _log_action("chat", f"Найдено {len(active_chats)} чатов с новыми сообщениями")
 
         for avtor24_id in active_chats:
+            if _shutting_down or not bot_running:
+                break
             try:
                 # Ищем заказ в БД
                 async with async_session() as session:
@@ -772,6 +774,34 @@ async def chat_responder_job() -> None:
                         direction="incoming",
                         text=last_msg.text,
                     )
+
+                # Скачиваем файлы из чата (если заказчик прикрепил)
+                files_summary = ""
+                if last_msg.has_files and last_msg.file_urls:
+                    try:
+                        downloaded_paths = await download_chat_files(
+                            page, avtor24_id, last_msg.file_urls,
+                        )
+                        if downloaded_paths:
+                            await _log_action(
+                                "chat",
+                                f"Скачано {len(downloaded_paths)} файлов из чата: "
+                                f"{', '.join(p.split('/')[-1] for p in downloaded_paths)}",
+                                order_id=order.id,
+                            )
+                            # Извлекаем содержимое для контекста
+                            try:
+                                from src.analyzer.file_analyzer import extract_all_content
+                                from pathlib import Path
+                                content = await extract_all_content(
+                                    [Path(p) for p in downloaded_paths]
+                                )
+                                if content and content.get("all_text"):
+                                    files_summary = content["all_text"][:2000]
+                            except Exception as e:
+                                logger.warning("Ошибка извлечения контента из файлов чата: %s", e)
+                    except Exception as e:
+                        logger.warning("Ошибка скачивания файлов из чата %s: %s", avtor24_id, e)
 
                 # Парсинг ответа заказчика: обновляем поля если чего-то не хватает
                 if not order.antiplagiat_system or not order.required_uniqueness:
@@ -828,6 +858,7 @@ async def chat_responder_job() -> None:
                     formatting_requirements=order.formatting_requirements or "",
                     structure=order.structure or "",
                     special_requirements=order.special_requirements or "",
+                    files_summary=files_summary,
                 )
 
                 # Отправляем ответ
@@ -959,6 +990,8 @@ async def check_accepted_bids_job() -> None:
         ).all()
 
         for item in active_items:
+            if _shutting_down or not bot_running:
+                break
             try:
                 import re
                 # Извлекаем order_id
@@ -1003,6 +1036,40 @@ async def check_accepted_bids_job() -> None:
                             )
 
                         await _log_action("accept", f"Заказ #{oid} принят заказчиком", order_id=order.id)
+
+                        # Отправляем уточняющее сообщение (если не хватает данных)
+                        try:
+                            from src.chat_ai.responder import generate_clarifying_message
+                            from src.scraper.chat import send_message as chat_send_message
+
+                            await browser_manager.random_delay(min_sec=3, max_sec=8)
+                            clarify_msg = await generate_clarifying_message(
+                                work_type=order.work_type or "",
+                                subject=order.subject or "",
+                                title=order.title or "",
+                                description=order.description or "",
+                                required_uniqueness=order.required_uniqueness,
+                                antiplagiat_system=order.antiplagiat_system or "",
+                                bid_price=order.bid_price or 0,
+                            )
+                            if clarify_msg:
+                                send_ok = await chat_send_message(page, oid, clarify_msg.text)
+                                if send_ok:
+                                    async with async_session() as session:
+                                        await create_message(
+                                            session,
+                                            order_id=order.id,
+                                            direction="outgoing",
+                                            text=clarify_msg.text,
+                                            is_auto_reply=True,
+                                        )
+                                    await _log_action(
+                                        "chat",
+                                        f"Уточняющее сообщение отправлено: \"{clarify_msg.text[:100]}\"",
+                                        order_id=order.id,
+                                    )
+                        except Exception as e:
+                            logger.warning("Ошибка отправки уточняющего сообщения: %s", e)
 
             except Exception as e:
                 logger.warning("Ошибка проверки статуса заказа: %s", e)

@@ -26,6 +26,12 @@ class ChatMessage:
     is_incoming: bool  # True = от заказчика, False = от нас
     timestamp: Optional[str] = None
     is_system: bool = False  # "Вы сделали ставку", "Вас выбрали автором" и т.д.
+    has_files: bool = False  # Есть ли прикреплённые файлы
+    file_urls: list = None  # URL файлов для скачивания
+
+    def __post_init__(self):
+        if self.file_urls is None:
+            self.file_urls = []
 
 
 def _order_page_url(order_id: str) -> str:
@@ -186,11 +192,37 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                     const timeEl = item.querySelector('[class*="Time"]');
                     if (timeEl) timestamp = (timeEl.innerText || '').trim();
 
+                    // Обнаружение прикреплённых файлов
+                    const fileUrls = [];
+                    // Ищем ссылки на файлы (download links, file attachments)
+                    const fileLinks = item.querySelectorAll(
+                        'a[href*="/download/"], a[href*="/file/"], a[href*="/attachment/"], ' +
+                        'a[href*="/ajax/"], a[download], ' +
+                        '[class*="FileStyled"] a, [class*="Attachment"] a, [class*="file"] a'
+                    );
+                    fileLinks.forEach(link => {
+                        const href = link.href || link.getAttribute('href');
+                        if (href) fileUrls.push(href);
+                    });
+                    // Также ищем элементы с классом, похожим на файл
+                    const fileElements = item.querySelectorAll(
+                        '[class*="FileStyled"], [class*="AttachmentStyled"], [class*="FileMessage"]'
+                    );
+                    fileElements.forEach(el => {
+                        const link = el.querySelector('a');
+                        if (link) {
+                            const href = link.href || link.getAttribute('href');
+                            if (href && !fileUrls.includes(href)) fileUrls.push(href);
+                        }
+                    });
+
                     messages.push({
                         text: text.substring(0, 2000),
                         isSystem,
                         isOutgoing,
                         timestamp,
+                        hasFiles: fileUrls.length > 0,
+                        fileUrls: fileUrls,
                     });
                 });
 
@@ -200,6 +232,8 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
 
         result = []
         for msg in raw:
+            file_urls = msg.get("fileUrls", [])
+            has_files = msg.get("hasFiles", False) or len(file_urls) > 0
             if msg.get("isSystem"):
                 result.append(ChatMessage(
                     order_id=order_id,
@@ -207,6 +241,8 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                     is_incoming=False,
                     timestamp=msg.get("timestamp"),
                     is_system=True,
+                    has_files=has_files,
+                    file_urls=file_urls,
                 ))
             else:
                 result.append(ChatMessage(
@@ -214,6 +250,8 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                     text=msg["text"],
                     is_incoming=not msg.get("isOutgoing", False),
                     timestamp=msg.get("timestamp"),
+                    has_files=has_files,
+                    file_urls=file_urls,
                 ))
 
         return result
@@ -383,6 +421,31 @@ async def _dismiss_any_overlay(page: Page) -> None:
             await asyncio.sleep(1)
     except Exception:
         pass
+
+
+async def download_chat_files(page: Page, order_id: str, file_urls: list[str]) -> list[str]:
+    """Скачать файлы из чата (прикреплённые заказчиком).
+
+    Returns:
+        Список путей к скачанным файлам.
+    """
+    from src.scraper.file_handler import download_files
+
+    if not file_urls:
+        return []
+
+    try:
+        downloaded = await download_files(page, order_id, file_urls)
+        paths = [str(p) for p in downloaded]
+        if paths:
+            logger.info(
+                "Скачано %d файлов из чата заказа %s",
+                len(paths), order_id,
+            )
+        return paths
+    except Exception as e:
+        logger.warning("Ошибка скачивания файлов из чата %s: %s", order_id, e)
+        return []
 
 
 async def send_file_with_message(

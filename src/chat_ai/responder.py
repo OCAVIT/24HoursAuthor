@@ -131,6 +131,64 @@ async def generate_response(
     )
 
 
+async def generate_greeting_message(
+    work_type: str,
+    subject: str,
+    title: str,
+    description: str,
+    bid_price: int,
+) -> ChatResponse:
+    """Сгенерировать приветственное сообщение после постановки ставки.
+
+    Только приветствие — без уточняющих вопросов.
+    Вопросы задаются позже, когда заказчик выберет автора.
+    """
+    prompt_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты автор на платформе Автор24. Ты только что поставил ставку на заказ. "
+                "Напиши короткое приветственное сообщение заказчику (2-3 предложения). "
+                "Поздоровайся, скажи что тема знакома и ты готов выполнить работу качественно и в срок. "
+                "НЕ задавай никаких вопросов — просто приветствие и готовность. "
+                "Не упоминай AI, нейросети, GPT. Пиши как реальный студент-фрилансер. "
+                "Каждое сообщение должно быть уникальным — не повторяй шаблонные фразы."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Заказ: {work_type} по предмету {subject}.\n"
+                f"Тема: {title}\n"
+                f"Описание: {description[:500]}\n"
+                f"Ставка: {bid_price}₽"
+            ),
+        },
+    ]
+
+    result = await chat_completion(
+        messages=prompt_messages,
+        model=settings.openai_model_fast,
+        temperature=0.8,
+        max_tokens=200,
+    )
+
+    text = _sanitize_response(result["content"].strip())
+
+    logger.info(
+        "Приветственное сообщение сгенерировано: %d токенов, $%.4f",
+        result["total_tokens"], result["cost_usd"],
+    )
+
+    return ChatResponse(
+        text=text,
+        input_tokens=result["input_tokens"],
+        output_tokens=result["output_tokens"],
+        total_tokens=result["total_tokens"],
+        cost_usd=result["cost_usd"],
+    )
+
+
 async def generate_clarifying_message(
     work_type: str,
     subject: str,
@@ -139,11 +197,11 @@ async def generate_clarifying_message(
     required_uniqueness: Optional[int],
     antiplagiat_system: str,
     bid_price: int,
-) -> ChatResponse:
-    """Сгенерировать уточняющее сообщение после постановки ставки.
+) -> Optional[ChatResponse]:
+    """Сгенерировать уточняющее сообщение после принятия заказа.
 
     Если система антиплагиата или уникальность не указаны — спросить.
-    Если всё указано — "Все требования понятны, приступаю к работе после подтверждения!"
+    Если всё указано — вернуть None (уточнения не нужны).
     """
     missing = []
     if not antiplagiat_system:
@@ -152,17 +210,16 @@ async def generate_clarifying_message(
         missing.append("требуемый процент уникальности")
 
     if not missing:
-        text = "Добрый день! Все требования понятны, приступаю к работе после подтверждения!"
-        return ChatResponse(text=text)
+        return None  # Уточнения не нужны — все данные есть
 
     missing_str = " и ".join(missing)
     prompt_messages = [
         {
             "role": "system",
             "content": (
-                "Ты автор на платформе Автор24. Ты только что поставил ставку на заказ. "
-                "Напиши короткое приветственное сообщение заказчику (2-3 предложения). "
-                "Поздоровайся, скажи что готов выполнить работу, и вежливо спроси "
+                "Ты автор на платформе Автор24. Заказчик только что выбрал тебя автором. "
+                "Напиши короткое сообщение (2-3 предложения). "
+                "Поблагодари за выбор и вежливо уточни "
                 f"про {missing_str}. "
                 "Не упоминай AI, нейросети, GPT. Пиши как реальный студент."
             ),

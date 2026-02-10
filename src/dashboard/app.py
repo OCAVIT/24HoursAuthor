@@ -66,8 +66,39 @@ async def dashboard_stats(user: str = Depends(get_current_user)):
 async def toggle_bot(user: str = Depends(get_current_user)):
     """Включить/выключить бота."""
     import src.main as main_module
+
     main_module.bot_running = not main_module.bot_running
-    return {"ok": True, "bot_running": main_module.bot_running}
+    new_state = main_module.bot_running
+
+    # Pause/resume scheduler jobs to actually stop processing
+    try:
+        if new_state:
+            main_module.scheduler.resume()
+        else:
+            main_module.scheduler.pause()
+    except Exception:
+        pass  # Scheduler may not support pause in all states
+
+    # Log the action
+    try:
+        action = "system"
+        details = f"Бот {'запущен' if new_state else 'остановлен'} через дашборд"
+        async with async_session() as session:
+            from src.database.crud import create_action_log
+            await create_action_log(session, action=action, details=details)
+        # Also broadcast to log websocket
+        from src.notifications.websocket import log_manager
+        from datetime import datetime
+        await log_manager.broadcast({
+            "action": action,
+            "details": details,
+            "order_id": None,
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception:
+        pass
+
+    return {"ok": True, "bot_running": new_state}
 
 
 # ---------------------------------------------------------------------------
