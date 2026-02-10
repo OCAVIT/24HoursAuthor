@@ -106,7 +106,7 @@ function dashboard() {
 
             window.addEventListener('hashchange', () => {
                 const h = window.location.hash.replace('#', '') || 'overview';
-                this.navigate(h);
+                if (h !== this.currentPage) this.navigate(h);
             });
 
             /* Load initial data */
@@ -224,9 +224,8 @@ function dashboard() {
             const incomes = daily.map(d => d.income_rub || 0);
             const delivered = daily.map(d => d.orders_delivered || 0);
 
-            /* setTimeout instead of $nextTick — gives browser time to finish
-               x-show transition and calculate container dimensions */
-            setTimeout(() => {
+            /* Wait for x-show transition to finish (200ms) + one paint frame */
+            this._afterVisible(() => {
                 this.renderChart('incomeChart', '_incomeChart', 'bar', labels, [{
                     label: 'Доход (руб)', data: incomes,
                     backgroundColor: 'rgba(124,58,237,0.5)', borderColor: '#7c3aed',
@@ -237,7 +236,7 @@ function dashboard() {
                     borderColor: '#4ade80', backgroundColor: 'rgba(74,222,128,0.1)',
                     fill: true, tension: 0.3, pointRadius: 2,
                 }]);
-            }, 100);
+            });
         },
 
         /* ==================================================
@@ -295,7 +294,7 @@ function dashboard() {
             const labels = daily.map(d => d.date ? d.date.slice(5) : '');
             const incomes = daily.map(d => d.income_rub || 0);
 
-            setTimeout(() => {
+            this._afterVisible(() => {
                 this.renderChart('analyticsIncomeChart', '_analyticsIncomeChart', 'bar', labels, [{
                     label: 'Доход (руб)', data: incomes,
                     backgroundColor: 'rgba(124,58,237,0.5)', borderColor: '#7c3aed',
@@ -312,7 +311,7 @@ function dashboard() {
                     backgroundColor: colors.slice(0, modelLabels.length),
                     borderWidth: 0,
                 }], { cutout: '65%' });
-            }, 100);
+            });
         },
 
         /* ==================================================
@@ -503,9 +502,20 @@ function dashboard() {
         /* ==================================================
            CHART HELPER
            ================================================== */
+
+        /** Schedule callback after x-show transition completes and browser paints. */
+        _afterVisible(fn) {
+            requestAnimationFrame(() => { setTimeout(fn, 250); });
+        },
+
         renderChart(canvasId, storeKey, type, labels, datasets, extraOpts = {}) {
             const canvas = document.getElementById(canvasId);
             if (!canvas) return;
+
+            /* Skip if canvas container is hidden (0 dimensions) */
+            const rect = canvas.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return;
+
             if (this[storeKey]) { this[storeKey].destroy(); this[storeKey] = null; }
 
             try {

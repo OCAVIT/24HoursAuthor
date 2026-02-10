@@ -18,6 +18,13 @@
             }
         }
     </script>
+    <script>
+        /* Suppress Chart.js internal errors from ResizeObserver callbacks
+           (fires when x-show hides canvas container during page transitions) */
+        window.addEventListener('error', function(e) {
+            if (e.message && e.message.includes('getContext')) { e.preventDefault(); }
+        });
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <link rel="stylesheet" href="/dashboard/static/styles.css">
 </head>
