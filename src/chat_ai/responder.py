@@ -458,6 +458,86 @@ async def detect_customer_approval(
     }
 
 
+async def classify_assistant_messages(
+    messages: list[dict],
+) -> list[int]:
+    """Классифицировать сообщения чата через GPT-4o-mini: найти уведомления платформы.
+
+    На Автор24 "Ассистент" (платформа) присылает уведомления об изменении условий
+    заказа в виде обычных сообщений в чат. Формат: "Заказчик изменил в заказе: ..."
+    и другие системные сообщения.
+
+    Args:
+        messages: Список сообщений [{index: int, text: str}, ...].
+            Передаём только текст и индекс, без лишних данных.
+
+    Returns:
+        Список индексов сообщений, которые являются уведомлениями платформы
+        (ассистент / изменение условий / системные).
+    """
+    if not messages:
+        return []
+
+    # Формируем текст сообщений для классификации
+    msgs_text = "\n".join(
+        f"[{m['index']}] {m['text'][:300]}" for m in messages
+    )
+
+    prompt_messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты классифицируешь сообщения из чата на платформе Автор24 (фриланс для студенческих работ). "
+                "В чате участвуют: заказчик, автор (исполнитель) и платформа (ассистент). "
+                "Платформа отправляет уведомления об изменении условий заказа. "
+                "Типичные признаки сообщений платформы:\n"
+                "- \"Заказчик изменил в заказе: ...\" (изменение условий)\n"
+                "- \"Условия заказа изменены\" / \"Условия заказа обновлены\"\n"
+                "- \"Заказчик продлил срок\" / \"Заказчик изменил дедлайн\"\n"
+                "- Любые автоматические уведомления об изменениях параметров заказа\n"
+                "- Короткие формальные сообщения без личного обращения\n\n"
+                "НЕ считай платформенными:\n"
+                "- Личные сообщения от заказчика (вопросы, просьбы, обсуждение)\n"
+                "- Сообщения от автора\n"
+                "- Системные уведомления типа \"Вы сделали ставку\", \"Вас выбрали автором\"\n\n"
+                "Верни JSON: {\"platform_indices\": [список индексов сообщений от платформы]}\n"
+                "Если таких сообщений нет — верни {\"platform_indices\": []}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Сообщения чата:\n{msgs_text}",
+        },
+    ]
+
+    result = await chat_completion_json(
+        messages=prompt_messages,
+        model=settings.openai_model_fast,
+        temperature=0.0,
+        max_tokens=200,
+    )
+
+    try:
+        parsed = result["parsed"]
+    except (KeyError, TypeError):
+        try:
+            parsed = json.loads(result.get("content", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            parsed = {}
+
+    indices = parsed.get("platform_indices", [])
+    # Убеждаемся что это список int
+    indices = [int(i) for i in indices if isinstance(i, (int, float))]
+
+    logger.info(
+        "Классификация сообщений: %d из %d — платформа, %d токенов, $%.4f",
+        len(indices), len(messages),
+        result.get("total_tokens", 0), result.get("cost_usd", 0),
+    )
+
+    return indices
+
+
 def _build_context(
     order_description: str,
     order_status: str,

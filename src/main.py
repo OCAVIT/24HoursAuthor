@@ -56,6 +56,10 @@ _shutting_down = False
 # Сбрасывается при перезапуске; БД-дедупликация остаётся как fallback.
 _seen_order_ids: set[str] = set()
 
+# Кеш текстов ассистент-сообщений, которые уже обработаны: {order_id: set(text_hash)}
+# Предотвращает повторный fetch_order_detail для одних и тех же уведомлений
+_processed_assistant_msgs: dict[str, set[str]] = {}
+
 # Счётчик активных задач (для ожидания завершения при shutdown)
 _active_tasks = 0
 _active_tasks_lock = asyncio.Lock()
@@ -1067,7 +1071,10 @@ async def _handle_assistant_messages(
                 # Если заказ уже готов/доставлен, но условия существенно изменились,
                 # сбрасываем в "accepted" чтобы запустить повторную генерацию.
                 regen_statuses = ("delivered", "ready", "generating", "checking_plagiarism", "rewriting", "error")
-                significant_fields = {"work_type", "pages_min", "pages_max", "required_uniqueness", "subject"}
+                significant_fields = {
+                    "title", "description", "work_type", "subject",
+                    "pages_min", "pages_max", "required_uniqueness",
+                }
                 has_significant = bool(significant_fields & set(update_kwargs.keys()))
                 if order.status in regen_statuses and has_significant:
                     async with async_session() as session:
@@ -1234,7 +1241,7 @@ async def chat_responder_job() -> None:
     from src.scraper.auth import login
     from src.scraper.chat import get_active_chats, get_messages, send_message, download_chat_files
     from src.scraper.browser import browser_manager
-    from src.chat_ai.responder import generate_response, parse_customer_answer, generate_proactive_message
+    from src.chat_ai.responder import generate_response, parse_customer_answer, generate_proactive_message, classify_assistant_messages
     from src.database.crud import update_order_fields
 
     await _track_task()
@@ -1276,14 +1283,43 @@ async def chat_responder_job() -> None:
                     continue
 
                 # --- Обработка сообщений Ассистента (изменение условий заказа) ---
-                # ВСЕГДА проверяем Ассистента перед любыми другими действиями.
-                # Заказчик мог изменить условия — нужно обновить БД.
-                assistant_msgs = [m for m in chat_messages if m.is_assistant]
-                if assistant_msgs:
+                # GPT-4o-mini классифицирует сообщения: какие от платформы
+                # Дедупликация: сначала фильтруем уже обработанные по хешу текста
+                seen = _processed_assistant_msgs.get(avtor24_id, set())
+                candidate_msgs = [
+                    {"index": i, "text": m.text}
+                    for i, m in enumerate(chat_messages)
+                    if not m.is_system and hash(m.text.strip()) not in seen
+                ]
+                # Классификация через GPT (только если есть непроверенные)
+                assistant_indices: set[int] = set()
+                if candidate_msgs:
+                    try:
+                        classified = await classify_assistant_messages(candidate_msgs)
+                        assistant_indices = set(classified)
+                    except Exception as e:
+                        logger.warning("GPT-классификация не удалась для %s: %s, фолбэк на хардкод", avtor24_id, e)
+                        # Фолбэк: используем хардкод is_assistant
+                        assistant_indices = {
+                            i for i, m in enumerate(chat_messages) if m.is_assistant
+                        }
+
+                assistant_msgs = [chat_messages[i] for i in assistant_indices if i < len(chat_messages)]
+                # Фильтруем уже обработанные
+                new_assistant_msgs = [
+                    m for m in assistant_msgs
+                    if hash(m.text.strip()) not in seen
+                ]
+                if new_assistant_msgs:
                     prev_status = order.status
                     await _handle_assistant_messages(
-                        page, avtor24_id, order, assistant_msgs,
+                        page, avtor24_id, order, new_assistant_msgs,
                     )
+                    # Запоминаем обработанные сообщения
+                    if avtor24_id not in _processed_assistant_msgs:
+                        _processed_assistant_msgs[avtor24_id] = set()
+                    for m in new_assistant_msgs:
+                        _processed_assistant_msgs[avtor24_id].add(hash(m.text.strip()))
                     # Перечитываем заказ из БД (мог обновиться / отмениться / сброситься)
                     async with async_session() as session:
                         order = await get_order_by_avtor24_id(session, avtor24_id)
@@ -1306,7 +1342,8 @@ async def chat_responder_job() -> None:
 
                 # Последнее сообщение — от заказчика?
                 last_msg = chat_messages[-1]
-                if last_msg.is_assistant:
+                last_idx = len(chat_messages) - 1
+                if last_idx in assistant_indices:
                     continue  # Ассистент — не отвечаем
 
                 if not last_msg.is_incoming:
