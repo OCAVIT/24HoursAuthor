@@ -52,6 +52,16 @@ process.stdin.on("end", async () => {
 // Символов на страницу при Times New Roman 14pt, 1.5 интервал
 const CHARS_PER_PAGE = 1800;
 
+/** Проверить, является ли заголовок секцией библиографии. */
+function isBibliography(heading) {
+  const h = (heading || "").toLowerCase();
+  return (
+    h.includes("список литературы") ||
+    h.includes("библиограф") ||
+    h.includes("список источников")
+  );
+}
+
 async function generateDocx(data) {
   const {
     title = "Без названия",
@@ -101,6 +111,16 @@ async function generateDocx(data) {
       const label = section.heading || "";
       const level = section.level || 1;
 
+      // Оценка страниц для этого раздела
+      const chars = (section.text || "").length;
+      const sectionPages = Math.max(1, Math.ceil(chars / CHARS_PER_PAGE));
+
+      // Пропускаем секции без заголовка
+      if (!label.trim()) {
+        pageEstimate += sectionPages;
+        continue;
+      }
+
       // Формат: "Название ...... N"
       // Отступ для level 2
       const indent =
@@ -137,9 +157,7 @@ async function generateDocx(data) {
         })
       );
 
-      // Оценка страниц для этого раздела
-      const chars = (section.text || "").length;
-      pageEstimate += Math.max(1, Math.ceil(chars / CHARS_PER_PAGE));
+      pageEstimate += sectionPages;
     }
   }
 
@@ -148,6 +166,7 @@ async function generateDocx(data) {
     const heading = section.heading || "";
     const text = section.text || "";
     const level = section.level || 1;
+    const isBib = isBibliography(heading);
 
     // Новая страница перед главами (level 1)
     const pageBreak = level === 1;
@@ -156,44 +175,73 @@ async function generateDocx(data) {
     const headingLevel =
       level === 1 ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2;
 
-    docParagraphs.push(
-      new Paragraph({
-        children: [
-          new TextRun({
-            text: heading,
-            bold: true,
-            font: "Times New Roman",
-            size: fontSize,
-          }),
-        ],
-        heading: headingLevel,
-        alignment: level === 1 ? AlignmentType.CENTER : AlignmentType.LEFT,
-        spacing: { before: 200, after: 200, line: lineSpacing },
-        indent:
-          level > 1 ? { firstLine: convertMillimetersToTwip(12.5) } : {},
-        pageBreakBefore: pageBreak,
-      })
-    );
-
-    // Текст — разбиваем на абзацы
-    const paragraphs = text.split(/\n\n+/);
-    for (const para of paragraphs) {
-      if (!para.trim()) continue;
+    if (heading) {
       docParagraphs.push(
         new Paragraph({
           children: [
             new TextRun({
-              text: para.trim(),
+              text: heading,
+              bold: true,
               font: "Times New Roman",
               size: fontSize,
             }),
           ],
-          style: "Normal",
-          alignment: AlignmentType.JUSTIFIED,
-          spacing: { line: lineSpacing },
-          indent: { firstLine: convertMillimetersToTwip(12.5) },
+          heading: headingLevel,
+          alignment: level === 1 ? AlignmentType.CENTER : AlignmentType.LEFT,
+          spacing: { before: 200, after: 200, line: lineSpacing },
+          indent:
+            level > 1 ? { firstLine: convertMillimetersToTwip(12.5) } : {},
+          pageBreakBefore: pageBreak,
         })
       );
+    }
+
+    if (isBib) {
+      // Библиография: каждая строка — отдельная запись, без абзацного отступа
+      const lines = text.split(/\n/);
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        docParagraphs.push(
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: line.trim(),
+                font: "Times New Roman",
+                size: fontSize,
+              }),
+            ],
+            style: "Normal",
+            alignment: AlignmentType.JUSTIFIED,
+            spacing: { line: lineSpacing },
+            // Библиография: выступающий отступ (hanging indent)
+            indent: {
+              left: convertMillimetersToTwip(12.5),
+              hanging: convertMillimetersToTwip(12.5),
+            },
+          })
+        );
+      }
+    } else {
+      // Обычный текст — разбиваем на абзацы
+      const paragraphs = text.split(/\n\n+/);
+      for (const para of paragraphs) {
+        if (!para.trim()) continue;
+        docParagraphs.push(
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: para.trim(),
+                font: "Times New Roman",
+                size: fontSize,
+              }),
+            ],
+            style: "Normal",
+            alignment: AlignmentType.JUSTIFIED,
+            spacing: { line: lineSpacing },
+            indent: { firstLine: convertMillimetersToTwip(12.5) },
+          })
+        );
+      }
     }
   }
 

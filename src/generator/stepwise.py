@@ -5,6 +5,7 @@
 2. Каждый раздел генерируется отдельным API-вызовом
 3. В контекст передаётся краткое суммари предыдущих разделов
 4. После склейки проверяется объём, при нехватке — расширяется самый короткий раздел
+5. Библиография генерируется ПОСЛЕДНЕЙ с учётом цитируемых авторов из текста
 """
 
 import logging
@@ -57,6 +58,57 @@ def _accumulate(result: StepwiseResult, tokens_info: dict):
     result.cost_usd += tokens_info.get("cost_usd", 0.0)
     result.total_tokens = result.input_tokens + result.output_tokens
 
+
+# ---------------------------------------------------------------------------
+# Helpers: определяем тип раздела для контекстно-зависимых инструкций
+# ---------------------------------------------------------------------------
+
+def _is_bibliography(section: SectionPlan) -> bool:
+    """Список литературы / библиография."""
+    name_lower = section.name.lower()
+    return "литератур" in name_lower or "библиограф" in name_lower or "источник" in name_lower
+
+
+def _is_conclusion(section: SectionPlan) -> bool:
+    """Заключение."""
+    return "заключени" in section.name.lower()
+
+
+def _is_chapter_intro(section: SectionPlan, plan: list[SectionPlan], idx: int) -> bool:
+    """Глава, за которой идут подразделы (1.1, 1.2, ...) — нужен только краткий вводный абзац."""
+    name_lower = section.name.lower()
+    if "глава" not in name_lower:
+        return False
+    # Проверяем: следующий раздел — подраздел? (начинается с цифры.цифра)
+    if idx + 1 < len(plan):
+        next_name = plan[idx + 1].name.strip()
+        if re.match(r'^\d+\.\d+', next_name):
+            return True
+    return False
+
+
+def _extract_cited_authors(sections: list[GeneratedSection]) -> list[str]:
+    """Извлечь фамилии авторов, упомянутых в тексте, для согласования с библиографией."""
+    all_text = " ".join(
+        s.text for s in sections
+        if not _is_bibliography(SectionPlan(name=s.name, target_words=0))
+    )
+    authors = set()
+    # Зарубежные авторы: Tomlinson (2001), Hattie (2009)
+    for m in re.finditer(r'([A-Z][a-z]{2,})\s*\(\d{4}\)', all_text):
+        authors.add(m.group(1))
+    # Русские авторы: Выготский (1978), А. К. Маркова (1983)
+    for m in re.finditer(r'([А-ЯЁ][а-яё]{2,}(?:ой|ого|ину|ина|ова|ева|ёва|ый|ий)?)\s*\(\d{4}\)', all_text):
+        authors.add(m.group(1))
+    # Инициалы + фамилия: по мнению А. К. Маркова
+    for m in re.finditer(r'[А-ЯЁ]\.\s?[А-ЯЁ]\.\s?([А-ЯЁ][а-яё]{2,})', all_text):
+        authors.add(m.group(1))
+    return sorted(authors)
+
+
+# ---------------------------------------------------------------------------
+# Основные функции генерации
+# ---------------------------------------------------------------------------
 
 def clean_section_text(name: str, text: str) -> str:
     """Постобработка текста раздела: убрать markdown и дублирующийся заголовок."""
@@ -113,6 +165,7 @@ async def generate_plan(
         '\nВерни строго JSON: {"sections": [{"name": "Название раздела", "target_words": 500}, ...]}'
         f"\nВАЖНО: сумма target_words всех разделов должна быть >= {total_words}."
         "\nКаждый раздел будет генерироваться отдельным запросом, поэтому дели на логические блоки."
+        "\nЕсли есть главы с подразделами — указывай и главу (как вводный блок на 100-150 слов), и каждый подраздел отдельно."
     )
 
     result = await chat_completion_json(
@@ -171,6 +224,8 @@ async def generate_section(
     methodology_summary: Optional[str] = None,
     temperature: float = 0.7,
     required_uniqueness: Optional[int] = None,
+    extra_instructions: str = "",
+    cited_authors: Optional[list[str]] = None,
 ) -> tuple[GeneratedSection, dict]:
     """Шаг 2: Генерация одного раздела."""
     target_chars = section.target_words * 7  # ~7 символов на русское слово с пробелами
@@ -187,7 +242,9 @@ async def generate_section(
         "\n- Не повторяй одну мысль разными словами."
         "\n- Если упоминаешь конкретные организации, события, даты, статистику — используй только достоверные данные, не выдумывай."
         "\n- Если в теме работы подразумеваются примеры (компании, страны, исследования) — приводи общеизвестные, легко проверяемые."
-        "\n- Каждый тезис подкрепляй аргументом или примером.",
+        "\n- Каждый тезис подкрепляй аргументом или примером."
+        "\n- НЕ используй фразы: «таким образом», «необходимо отметить», «следует подчеркнуть», «стоит отметить», «в заключение следует отметить», «не менее важным является», «особое внимание следует уделить»."
+        "\n- НЕ заканчивай раздел обобщающим абзацем-выводом (кроме конца главы).",
         "\nВАЖНО:"
         "\n- НЕ начинай текст с заголовка раздела — заголовок добавляется автоматически."
         "\n- НЕ используй markdown-разметку (символы #, ##, **, *, >, ```, -)."
@@ -195,16 +252,27 @@ async def generate_section(
     ]
 
     # Специальные инструкции для библиографии
-    name_lower = section.name.lower()
-    if "литератур" in name_lower or "библиограф" in name_lower or "источник" in name_lower:
+    if _is_bibliography(section):
+        authors_hint = ""
+        if cited_authors:
+            authors_hint = (
+                f"\nВ тексте работы упоминались следующие авторы: {', '.join(cited_authors)}."
+                "\nОБЯЗАТЕЛЬНО включи в список литературы всех этих авторов с реальными работами."
+            )
         user_parts.append(
-            "\nОСОБЫЕ ТРЕБОВАНИЯ К БИБЛИОГРАФИИ:"
-            "\n- Используй ТОЛЬКО реально существующие и широко известные источники."
-            "\n- Предпочитай учебники известных авторов, которые точно существуют."
-            "\n- Формат оформления: ГОСТ Р 7.0.5-2008."
-            "\n- НЕ придумывай несуществующих книг, авторов или издательств."
-            "\n- Лучше дать меньше источников, но реальных, чем много вымышленных."
+            "\nСТРОГИЕ ТРЕБОВАНИЯ К СПИСКУ ЛИТЕРАТУРЫ:"
+            "\n- Оформление СТРОГО по ГОСТ Р 7.0.5-2008."
+            "\n- Каждый источник — ОДНА СТРОКА. БЕЗ аннотаций, описаний и комментариев после выходных данных."
+            "\n- Формат: Автор, И. О. Название работы / И. О. Автор. — Город: Издательство, Год. — Страниц с."
+            "\n- Для зарубежных: Author, A. B. Title / A. B. Author. — City: Publisher, Year. — Pages p."
+            "\n- Расположи в алфавитном порядке: сначала русскоязычные, затем иностранные."
+            "\n- НЕ выдумывай несуществующих книг — используй реальные, широко известные работы."
+            "\n- Каждая строка начинается с порядкового номера: 1. ..., 2. ..., и т.д."
+            f"{authors_hint}"
         )
+    # Инструкции для вводного абзаца главы или заключения
+    elif extra_instructions:
+        user_parts.append(extra_instructions)
 
     if previous_summaries:
         summaries_text = "\n".join(previous_summaries[-3:])
@@ -272,11 +340,18 @@ async def expand_to_target(
         needed_chars = target_chars - total_chars
         needed_words = max(50, needed_chars // 7)
 
-        # Найти самый короткий раздел (не расширяем список литературы)
+        # Не расширяем список литературы, заключение и вводные абзацы глав
         expandable = [
             (i, s) for i, s in enumerate(sections)
-            if "литератур" not in s.name.lower() and "библиограф" not in s.name.lower()
+            if not _is_bibliography(SectionPlan(name=s.name, target_words=0))
+            and not _is_conclusion(SectionPlan(name=s.name, target_words=0))
+            and "глава" not in s.name.lower().split(".")[0].strip()
         ]
+        if not expandable:
+            expandable = [
+                (i, s) for i, s in enumerate(sections)
+                if not _is_bibliography(SectionPlan(name=s.name, target_words=0))
+            ]
         if not expandable:
             expandable = list(enumerate(sections))
 
@@ -296,13 +371,15 @@ async def expand_to_target(
                     f"Тема работы: \"{title}\"\n"
                     f"Раздел: {shortest.name}\n\n"
                     f"Текущий текст раздела:\n{shortest.text}\n\n"
-                    f"Расширь этот раздел, добавь примеры, детали и аргументацию, "
+                    f"Расширь этот раздел, добавь новые примеры, детали и аргументацию, "
                     f"нужно ещё {needed_words} слов. "
                     f"Верни ПОЛНЫЙ текст раздела (старый + новый контент, без повторов)."
                     f"\n\nВАЖНО:"
                     f"\n- НЕ добавляй заголовок раздела — он добавляется автоматически."
                     f"\n- НЕ используй markdown-разметку (символы #, ##, **, *, >, ```, -)."
                     f"\n- Пиши только чистый текст абзацами."
+                    f"\n- Добавляй НОВУЮ информацию, не перефразируй существующую."
+                    f"\n- НЕ используй фразы: «таким образом», «необходимо отметить», «стоит отметить»."
                 )},
             ],
             model=settings.openai_model_main,
@@ -354,7 +431,8 @@ async def stepwise_generate(
 
     1. GPT-4o-mini генерирует план (JSON: разделы + target_words)
     2. Каждый раздел генерируется GPT-4o, с суммари предыдущих как контекст
-    3. После склейки проверяется общий объём, при нехватке — расширяется самый короткий
+    3. Библиография генерируется ПОСЛЕДНЕЙ с учётом цитируемых авторов
+    4. После склейки проверяется общий объём, при нехватке — расширяется самый короткий
     """
     target_chars = pages * CHARS_PER_PAGE
 
@@ -375,10 +453,42 @@ async def stepwise_generate(
 
     plan_text = format_plan(plan)
 
-    # Шаг 2: Генерация каждого раздела
+    # Разделяем план: контентные разделы и библиография
+    content_plan: list[SectionPlan] = []
+    bib_plan: list[SectionPlan] = []
+    for section in plan:
+        if _is_bibliography(section):
+            bib_plan.append(section)
+        else:
+            content_plan.append(section)
+
+    # Шаг 2: Генерация контентных разделов
     previous_summaries: list[str] = []
 
-    for section in plan:
+    for idx, section in enumerate(content_plan):
+        # Определяем дополнительные инструкции по типу раздела
+        extra = ""
+        if _is_chapter_intro(section, content_plan, idx):
+            extra = (
+                "\nЭТОТ РАЗДЕЛ — ВВОДНАЯ ЧАСТЬ ГЛАВЫ (не подраздел)."
+                "\nНапиши РОВНО 1-2 абзаца (100-150 слов):"
+                "\n- Кратко обозначь, какие вопросы рассматриваются в подразделах этой главы."
+                "\n- НЕ раскрывай содержание подробно — оно будет написано в подразделах."
+                "\n- НЕ давай определения, классификации, примеры — это материал подразделов."
+                "\nПревышение объёма приведёт к дублированию с подразделами."
+            )
+        elif _is_conclusion(section):
+            extra = (
+                "\nЗАКЛЮЧЕНИЕ должно быть КРАТКИМ (2-3 страницы, 500-750 слов максимум)."
+                "\nСтруктура заключения:"
+                "\n- По 2-3 предложения с ключевым выводом по КАЖДОЙ главе."
+                "\n- Оценка степени достижения цели исследования."
+                "\n- Практическая значимость результатов (2-3 предложения)."
+                "\n- 1-2 рекомендации или перспективы дальнейших исследований."
+                "\nНЕ пересказывай содержание работы. НЕ вводи новую информацию. Только выводы."
+                "\nНЕ повторяй формулировки из текста работы — перефразируй."
+            )
+
         generated, tokens_info = await generate_section(
             section=section,
             title=title,
@@ -389,11 +499,34 @@ async def stepwise_generate(
             methodology_summary=methodology_summary,
             temperature=temperature,
             required_uniqueness=required_uniqueness,
+            extra_instructions=extra,
         )
         sw.sections.append(generated)
         _accumulate(sw, tokens_info)
 
         previous_summaries.append(make_summary(generated))
+
+    # Шаг 2.5: Генерация библиографии (если есть) с учётом цитируемых авторов
+    if bib_plan:
+        cited_authors = _extract_cited_authors(sw.sections)
+        logger.info("Найдено %d цитируемых авторов для библиографии: %s",
+                     len(cited_authors), ", ".join(cited_authors[:10]))
+
+        for section in bib_plan:
+            generated, tokens_info = await generate_section(
+                section=section,
+                title=title,
+                subject=subject,
+                plan_text=plan_text,
+                system_prompt=system_prompt,
+                previous_summaries=previous_summaries,
+                methodology_summary=methodology_summary,
+                temperature=0.3,  # Низкая температура для точности библиографии
+                required_uniqueness=required_uniqueness,
+                cited_authors=cited_authors,
+            )
+            sw.sections.append(generated)
+            _accumulate(sw, tokens_info)
 
     # Шаг 3: Расширение до целевого объёма
     sw.sections, tokens_info = await expand_to_target(

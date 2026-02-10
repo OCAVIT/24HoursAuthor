@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -129,9 +130,7 @@ def _sections_from_plan(text: str, plan: dict) -> list[dict]:
     parts = _split_by_markers(remaining, markers)
 
     for heading, body in parts:
-        level = 1
-        if any(kw in heading.lower() for kw in ["подраздел", "."]):
-            level = 2
+        level = _detect_heading_level(heading)
 
         sections.append({
             "heading": heading,
@@ -145,18 +144,42 @@ def _sections_from_plan(text: str, plan: dict) -> list[dict]:
     return sections
 
 
-def _sections_from_text(text: str) -> list[dict]:
-    """Разбить текст на секции по обнаруженным заголовкам."""
-    import re
+def _detect_heading_level(heading: str) -> int:
+    """Определить уровень заголовка: 1 = глава/введение/заключение, 2 = подраздел."""
+    if not heading:
+        return 1
+    h = heading.strip()
+    # Подразделы: "1.1 ...", "2.3 ...", "1.1. ..." — цифра.цифра
+    if re.match(r'^\d+\.\d+', h):
+        return 2
+    return 1
 
+
+def _is_bibliography_heading(heading: str) -> bool:
+    """Проверить, является ли заголовок разделом библиографии."""
+    h = heading.strip().lower()
+    return "список литературы" in h or "библиограф" in h or "список источников" in h
+
+
+def _sections_from_text(text: str) -> list[dict]:
+    """Разбить текст на секции по обнаруженным заголовкам.
+
+    Ключевые улучшения:
+    - Подразделы (1.1, 2.3) корректно определяются как level 2
+    - После "СПИСОК ЛИТЕРАТУРЫ" все строки — тело библиографии, не заголовки
+    - Нумерованные строки библиографии не разбиваются на отдельные секции
+    """
     # Паттерны заголовков
     heading_patterns = [
         r"^(ВВЕДЕНИЕ|ЗАКЛЮЧЕНИЕ|СПИСОК ЛИТЕРАТУРЫ|СОДЕРЖАНИЕ)$",
         r"^(Введение|Заключение|Список литературы|Содержание)$",
         r"^(Глава\s+\d+[.\s]*.*)$",
         r"^(ГЛАВА\s+\d+[.\s]*.*)$",
-        r"^(\d+\.\s+.+)$",
-        r"^(\d+\.\d+\.\s+.+)$",
+        # Подразделы: 1.1 Текст, 2.3 Текст, 1.1. Текст (цифра.цифра[.] пробел текст)
+        r"^(\d+\.\d+\.?\s+[A-ZА-ЯЁ].*)$",
+        # Главы без слова "Глава": 1. Текст, 2. Текст (одиночная цифра.пробел)
+        # НО: не должно быть внутри библиографии (обрабатывается через state)
+        r"^(\d+\.\s+[A-ZА-ЯЁ][A-ZА-ЯЁa-zа-яё].*)$",
     ]
     combined_pattern = "|".join(heading_patterns)
 
@@ -164,18 +187,30 @@ def _sections_from_text(text: str) -> list[dict]:
     sections = []
     current_heading = ""
     current_body_lines: list[str] = []
+    in_bibliography = False  # Флаг: мы внутри раздела библиографии
 
     for line in lines:
         stripped = line.strip()
+
+        # Если мы внутри библиографии — все строки идут как тело
+        if in_bibliography:
+            current_body_lines.append(line)
+            continue
+
         if stripped and re.match(combined_pattern, stripped, re.MULTILINE):
+            # Сохраняем предыдущую секцию
             if current_heading or current_body_lines:
                 sections.append({
                     "heading": current_heading,
                     "text": "\n".join(current_body_lines).strip(),
-                    "level": 2 if "." in current_heading[:5] else 1,
+                    "level": _detect_heading_level(current_heading),
                 })
             current_heading = stripped
             current_body_lines = []
+
+            # Проверяем: это начало библиографии?
+            if _is_bibliography_heading(stripped):
+                in_bibliography = True
         else:
             current_body_lines.append(line)
 
@@ -184,7 +219,7 @@ def _sections_from_text(text: str) -> list[dict]:
         sections.append({
             "heading": current_heading,
             "text": "\n".join(current_body_lines).strip(),
-            "level": 2 if "." in current_heading[:5] else 1,
+            "level": _detect_heading_level(current_heading),
         })
 
     if not sections:
@@ -196,7 +231,6 @@ def _sections_from_text(text: str) -> list[dict]:
 def _split_by_markers(text: str, markers: list[str]) -> list[tuple[str, str]]:
     """Разбить текст по маркерам-заголовкам."""
     parts = []
-    remaining = text
 
     found_positions: list[tuple[int, str]] = []
     text_lower = text.lower()
@@ -205,8 +239,14 @@ def _split_by_markers(text: str, markers: list[str]) -> list[tuple[str, str]]:
         if pos >= 0:
             found_positions.append((pos, marker))
 
-    # Сортируем по позиции
+    # Сортируем по позиции и убираем дубликаты (близкие позиции)
     found_positions.sort(key=lambda x: x[0])
+    # Дедупликация: если два маркера в пределах 5 символов — оставляем первый
+    deduped = []
+    for pos, marker in found_positions:
+        if not deduped or pos - deduped[-1][0] > 5:
+            deduped.append((pos, marker))
+    found_positions = deduped
 
     if not found_positions:
         return [("", text)]
@@ -216,13 +256,29 @@ def _split_by_markers(text: str, markers: list[str]) -> list[tuple[str, str]]:
     if first_pos > 50:
         parts.append(("", text[:first_pos].strip()))
 
+    in_bibliography = False
+
     for i, (pos, marker) in enumerate(found_positions):
         next_pos = found_positions[i + 1][0] if i + 1 < len(found_positions) else len(text)
+
+        # Если мы уже в библиографии — не разбиваем дальше
+        if in_bibliography:
+            continue
+
         # Найти конец строки заголовка
         end_of_line = text.find("\n", pos)
         if end_of_line < 0:
             end_of_line = len(text)
         heading = text[pos:end_of_line].strip()
+
+        # Проверяем: это начало библиографии?
+        if _is_bibliography_heading(heading):
+            in_bibliography = True
+            # Всё от этого маркера до конца — библиография
+            body = text[end_of_line:].strip()
+            parts.append((heading, body))
+            continue
+
         body = text[end_of_line:next_pos].strip()
         parts.append((heading, body))
 
