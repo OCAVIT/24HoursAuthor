@@ -61,5 +61,9 @@ scripts/test_output.txt
 scripts/extract_selectors.py
 scripts/full_parse_test.py
 
+# Project docs (private)
+CLAUDE.md
+INSTRUCTIONS.md
+
 # Windows artifacts
 nul
