@@ -60,6 +60,26 @@ async def analyze_and_bid(
         result.error = "Заказ уже обработан"
         return result
 
+    # Gate: пропускаем заказы с .rar файлами
+    rar_files = [f for f in (order.file_names or []) if f.lower().endswith(".rar")]
+    if rar_files:
+        logger.info("Пропуск заказа %s: содержит .rar файлы: %s", order.order_id, rar_files)
+        db_order = await create_order(
+            session,
+            avtor24_id=order.order_id,
+            title=order.title,
+            work_type=order.work_type,
+            subject=order.subject,
+            description=order.description,
+            budget_rub=order.budget,
+            score=0,
+            status="rejected",
+        )
+        result.db_order_id = db_order.id
+        result.status = "rejected"
+        result.error = f"Пропущен: .rar файлы ({', '.join(rar_files)})"
+        return result
+
     # Скоринг
     score = await score_order(order)
     result.score = score
