@@ -972,6 +972,12 @@ async def _handle_assistant_messages(
 
         # Собираем поля для обновления (только изменившиеся)
         update_kwargs = {}
+        if detail.title and detail.title != order.title:
+            update_kwargs["title"] = detail.title
+        if detail.work_type and detail.work_type != (order.work_type or ""):
+            update_kwargs["work_type"] = detail.work_type
+        if detail.subject and detail.subject != (order.subject or ""):
+            update_kwargs["subject"] = detail.subject
         if detail.description and detail.description != (order.description or ""):
             update_kwargs["description"] = detail.description
         if detail.required_uniqueness and detail.required_uniqueness != order.required_uniqueness:
@@ -990,8 +996,6 @@ async def _handle_assistant_messages(
             update_kwargs["budget_rub"] = detail.budget_rub
         if detail.deadline and detail.deadline != (str(order.deadline) if order.deadline else None):
             update_kwargs["deadline"] = detail.deadline
-        if detail.title and detail.title != order.title:
-            update_kwargs["title"] = detail.title
 
         if update_kwargs:
             async with async_session() as session:
@@ -1018,13 +1022,14 @@ async def _handle_assistant_messages(
                 )
 
             # --- Проверка прибыльности после изменения условий ---
+            # Используем обновлённый work_type из detail (мог измениться)
             bid_price = order.bid_price
-            work_type = order.work_type or "Другое"
-            if bid_price and not is_profitable(bid_price, work_type):
+            new_work_type = update_kwargs.get("work_type", order.work_type) or "Другое"
+            if bid_price and not is_profitable(bid_price, new_work_type):
                 await _log_action(
                     "chat",
                     f"Заказ #{avtor24_id} стал нерентабельным после изменения условий "
-                    f"(bid={bid_price}, work_type={work_type}), отменяем",
+                    f"(bid={bid_price}, work_type={new_work_type}), отменяем",
                     order_id=order.id,
                 )
                 cancelled = await cancel_order(page, avtor24_id)
@@ -1057,6 +1062,38 @@ async def _handle_assistant_messages(
                         f"Не удалось отменить нерентабельный заказ #{avtor24_id} (кнопка не найдена?)",
                         order_id=order.id,
                     )
+            else:
+                # --- Пере-генерация если условия изменились на уже обработанном заказе ---
+                # Если заказ уже готов/доставлен, но условия существенно изменились,
+                # сбрасываем в "accepted" чтобы запустить повторную генерацию.
+                regen_statuses = ("delivered", "ready", "generating", "checking_plagiarism", "rewriting", "error")
+                significant_fields = {"work_type", "pages_min", "pages_max", "required_uniqueness", "subject"}
+                has_significant = bool(significant_fields & set(update_kwargs.keys()))
+                if order.status in regen_statuses and has_significant:
+                    async with async_session() as session:
+                        await update_order_status(
+                            session, order.id, "accepted",
+                            error_message=None,
+                        )
+                    await _log_action(
+                        "generate",
+                        f"Заказ #{avtor24_id} сброшен '{order.status}' → 'accepted' "
+                        f"(условия изменены Ассистентом: {changes_str}), перегенерация",
+                        order_id=order.id,
+                    )
+                    async with async_session() as session:
+                        await push_notification(
+                            session,
+                            type="new_message",
+                            title=f"Перегенерация: заказ #{avtor24_id}",
+                            body={
+                                "order_id": avtor24_id,
+                                "customer_message": f"Условия изменены ({changes_str}), работа будет перегенерирована",
+                                "auto_reply": "",
+                                "auto_replied": False,
+                            },
+                            order_id=order.id,
+                        )
         else:
             await _log_action(
                 "chat",
@@ -1226,7 +1263,9 @@ async def chat_responder_job() -> None:
                         continue
 
                 # Пропускаем завершённые/отменённые заказы
-                if order.status in ("delivered", "completed", "rejected", "cancelled"):
+                # "delivered" НЕ пропускаем — заказчик может просить правки,
+                # а условия могли измениться через Ассистента.
+                if order.status in ("completed", "rejected", "cancelled"):
                     logger.debug("Чат %s пропущен: статус '%s'", avtor24_id, order.status)
                     continue
 
@@ -1237,30 +1276,33 @@ async def chat_responder_job() -> None:
                     continue
 
                 # --- Обработка сообщений Ассистента (изменение условий заказа) ---
-                # Пропускаем при первом контакте с чатом: старые сообщения Ассистента
-                # уже учтены при парсинге деталей заказа. Обрабатываем только если
-                # у нас уже есть исходящие сообщения (= мы уже вели этот чат).
+                # ВСЕГДА проверяем Ассистента перед любыми другими действиями.
+                # Заказчик мог изменить условия — нужно обновить БД.
                 assistant_msgs = [m for m in chat_messages if m.is_assistant]
                 if assistant_msgs:
+                    prev_status = order.status
+                    await _handle_assistant_messages(
+                        page, avtor24_id, order, assistant_msgs,
+                    )
+                    # Перечитываем заказ из БД (мог обновиться / отмениться / сброситься)
                     async with async_session() as session:
-                        db_msgs = await get_messages_for_order(session, order.id)
-                    has_outgoing = any(m.direction == "outgoing" for m in db_msgs)
-                    if has_outgoing:
-                        await _handle_assistant_messages(
-                            page, avtor24_id, order, assistant_msgs,
-                        )
-                        # Перечитываем заказ из БД (мог обновиться)
-                        async with async_session() as session:
-                            order = await get_order_by_avtor24_id(session, avtor24_id)
-                        if not order:
-                            continue
-                    else:
+                        order = await get_order_by_avtor24_id(session, avtor24_id)
+                    if not order:
+                        continue
+                    # Если заказ был отменён или отправлен на перегенерацию — не отвечаем в чат
+                    if order.status == "cancelled":
+                        continue
+                    if order.status == "accepted" and prev_status in (
+                        "delivered", "ready", "generating", "checking_plagiarism", "rewriting", "error",
+                    ):
+                        # Сброшен на перегенерацию — не пишем в чат,
+                        # process_accepted_orders_job перепарсит и сгенерирует заново
                         await _log_action(
                             "chat",
-                            f"Пропущены {len(assistant_msgs)} сообщений Ассистента "
-                            f"по заказу #{avtor24_id} (первый контакт, условия уже в БД)",
+                            f"Чат #{avtor24_id}: условия изменены, ответ отложен до перегенерации",
                             order_id=order.id,
                         )
+                        continue
 
                 # Последнее сообщение — от заказчика?
                 last_msg = chat_messages[-1]
