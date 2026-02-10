@@ -27,6 +27,7 @@ from src.database.crud import (
     upsert_daily_stats,
     get_daily_stats,
 )
+from src.analyzer.price_calculator import estimate_income
 from src.notifications.events import push_notification
 from src.notifications.websocket import notification_manager, log_manager
 from src.scraper.antiban import (
@@ -210,6 +211,14 @@ async def scan_orders_job() -> None:
                     await _log_action(
                         "score",
                         f"Заказ #{summary.order_id} — тип '{detail.work_type}' не поддерживается",
+                    )
+                    continue
+
+                # Пропускаем заказы с договорной ценой (нет фиксированного бюджета)
+                if not detail.budget_rub:
+                    await _log_action(
+                        "score",
+                        f"Заказ #{summary.order_id} — договорная цена, пропускаем",
                     )
                     continue
 
@@ -604,10 +613,11 @@ async def process_accepted_orders_job() -> None:
 
                 if send_ok:
                     async with async_session() as session:
+                        income = estimate_income(order.bid_price) if order.bid_price else 0
                         await update_order_status(
                             session, order.id, "delivered",
                             generated_file_path=str(docx_path),
-                            income_rub=order.bid_price,
+                            income_rub=income,
                         )
 
                         # Сохраняем исходящее сообщение
@@ -626,7 +636,7 @@ async def process_accepted_orders_job() -> None:
                             session,
                             today,
                             orders_delivered=(stats.orders_delivered if stats else 0) + 1,
-                            income_rub=(stats.income_rub if stats else 0) + (order.bid_price or 0),
+                            income_rub=(stats.income_rub if stats else 0) + income,
                             api_cost_usd=(stats.api_cost_usd if stats else 0) + gen_result.cost_usd,
                             api_tokens_used=(stats.api_tokens_used if stats else 0) + gen_result.total_tokens,
                         )
@@ -641,7 +651,7 @@ async def process_accepted_orders_job() -> None:
                                 "pages": gen_result.pages_approx,
                                 "uniqueness": uniqueness,
                                 "antiplagiat_system": order.antiplagiat_system or "textru",
-                                "income": order.bid_price,
+                                "income": income,
                                 "api_cost": gen_result.cost_usd,
                             },
                             order_id=order.id,

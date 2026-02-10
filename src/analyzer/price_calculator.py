@@ -52,6 +52,14 @@ FIXED_PRICE = {
 
 MIN_BID = 300  # Минимальная ставка
 
+# Комиссия платформы: автор получает 97% от ставки (3% забирает платформа)
+AUTHOR_COMMISSION_RATE = 0.97
+
+
+def estimate_income(bid_price: int) -> int:
+    """Рассчитать реальный доход автора после комиссии платформы (3%)."""
+    return int(bid_price * AUTHOR_COMMISSION_RATE)
+
 
 def calculate_price(order: OrderDetail) -> int:
     """Рассчитать оптимальную ставку в рублях.
