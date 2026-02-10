@@ -36,11 +36,25 @@ class ChatMessage:
 
     @property
     def is_assistant(self) -> bool:
-        """Сообщение от платформенного Ассистента (изменение условий заказа)."""
+        """Сообщение от платформенного Ассистента (изменение условий заказа).
+
+        На Автор24 изменения условий приходят как обычные сообщения
+        с текстом 'Заказчик изменил в заказе: ...' — без слова 'Ассистент'.
+        Также проверяем по имени отправителя на случай других форматов.
+        """
         if self.sender_name and "ассистент" in self.sender_name.lower():
             return True
         if self.is_system and self.text and "ассистент" in self.text.lower():
             return True
+        # Текстовые паттерны: реальный формат на Автор24
+        if self.text:
+            lower = self.text.lower()
+            if "заказчик изменил в заказе" in lower:
+                return True
+            if "заказчик изменил" in lower and "заказе" in lower:
+                return True
+            if "условия заказа" in lower and ("изменен" in lower or "изменён" in lower):
+                return True
         return False
 
 
@@ -86,49 +100,32 @@ async def get_order_page_info(page: Page, order_id: str) -> dict:
 
     return await page.evaluate("""
         () => {
-            const root = document.querySelector('#root');
-            if (!root) return {error: 'no root'};
-
-            const fullText = root.innerText || '';
+            const fullText = document.body.innerText || '';
 
             // Статус
             const accepted = fullText.includes('Вас выбрали автором');
-            const hasConfirmBtn = !!root.querySelector('button:has(div)');
             let confirmBtnFound = false;
-            root.querySelectorAll('button').forEach(btn => {
+            document.querySelectorAll('button').forEach(btn => {
                 if ((btn.innerText || '').trim() === 'Подтвердить') confirmBtnFound = true;
             });
-            const hasBidForm = !!root.querySelector('#MakeOffer__inputBid');
-            const hasChat = !!root.querySelector('textarea');
+            const hasBidForm = !!document.querySelector('#MakeOffer__inputBid');
+            const hasChat = !!document.querySelector('textarea');
 
             // Извлекаем сообщения из чата
             const messages = [];
-            const groupItems = root.querySelectorAll('[class*="GroupItem"]');
+            const groupItems = document.querySelectorAll('[class*="GroupItem"]');
             groupItems.forEach(item => {
                 const text = (item.innerText || '').trim();
                 if (!text) return;
 
-                // Системные сообщения
                 const isSystem = !!item.querySelector('[class*="MessageSystemStyled"]');
-
-                // Определяем направление: исходящие = наши сообщения
-                // На Avtor24 исходящие обычно справа (имеют другой styled)
                 const msgBase = item.querySelector('[class*="MessageBaseStyled"]');
+                const hasAvatar = !!item.querySelector('[class*="MessageAvatar"]');
                 let isOutgoing = false;
-                if (msgBase) {
-                    const cls = msgBase.className || '';
-                    // Проверяем наличие класса, указывающего на исходящее
-                    // Обычно исходящие имеют другой цвет/расположение
-                    // Ищем по классу или по parent контейнеру
-                    const parent = msgBase.closest('[class*="GroupStyled"]');
-                    if (parent) {
-                        // Если есть аватар с нашим именем или метка "Вы"
-                        const parentText = parent.innerText || '';
-                        // Исходящие обычно не имеют имени заказчика
-                    }
+                if (msgBase && !isSystem) {
+                    isOutgoing = !hasAvatar;
                 }
 
-                // Время
                 let timestamp = '';
                 const timeEl = item.querySelector('[class*="Time"], time, [class*="timestamp"]');
                 if (timeEl) timestamp = (timeEl.innerText || '').trim();
@@ -162,11 +159,8 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
 
         raw = await page.evaluate("""
             () => {
-                const root = document.querySelector('#root');
-                if (!root) return [];
-
                 const messages = [];
-                const items = root.querySelectorAll('[class*="GroupItem"]');
+                const items = document.querySelectorAll('[class*="GroupItem"]');
 
                 items.forEach(item => {
                     const text = (item.innerText || '').trim();
@@ -186,28 +180,16 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                         }
                     }
 
-                    // Определяем направление
-                    // На Avtor24: у исходящих сообщений MessageBaseStyled
-                    // имеет другой стиль/цвет (обычно синий/серый)
+                    // Определяем направление (incoming vs outgoing)
+                    // На Avtor24: входящие сообщения имеют аватар (MessageAvatarStyled),
+                    // исходящие (наши) — нет.
                     const msgBase = item.querySelector('[class*="MessageBaseStyled"]');
+                    const hasAvatar = !!item.querySelector('[class*="MessageAvatar"]');
                     let isOutgoing = false;
 
                     if (msgBase && !isSystem) {
-                        // Проверяем наличие класса для исходящих
-                        const cls = msgBase.className || '';
-                        // Ищем специфичные стили для outgoing
-                        // Обычно содержат "Out" или имеют другой вариант styled
-                        if (cls.includes('Out') || cls.includes('My') || cls.includes('Author')) {
-                            isOutgoing = true;
-                        }
-
-                        // Альтернатива: проверяем computed style (цвет фона)
-                        const style = window.getComputedStyle(msgBase);
-                        const bg = style.backgroundColor;
-                        // Исходящие обычно имеют синий/голубой фон
-                        if (bg && (bg.includes('66') || bg.includes('33') || bg.includes('99'))) {
-                            isOutgoing = true;
-                        }
+                        // Основной метод: аватар = входящее, нет аватара = исходящее
+                        isOutgoing = !hasAvatar;
                     }
 
                     let timestamp = '';
@@ -216,7 +198,6 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
 
                     // Обнаружение прикреплённых файлов
                     const fileUrls = [];
-                    // Ищем ссылки на файлы (download links, file attachments)
                     const fileLinks = item.querySelectorAll(
                         'a[href*="/download/"], a[href*="/file/"], a[href*="/attachment/"], ' +
                         'a[href*="/ajax/"], a[download], ' +
@@ -226,7 +207,6 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                         const href = link.href || link.getAttribute('href');
                         if (href) fileUrls.push(href);
                     });
-                    // Также ищем элементы с классом, похожим на файл
                     const fileElements = item.querySelectorAll(
                         '[class*="FileStyled"], [class*="AttachmentStyled"], [class*="FileMessage"]'
                     );
@@ -246,6 +226,7 @@ async def get_messages(page: Page, order_id: str) -> list[ChatMessage]:
                         hasFiles: fileUrls.length > 0,
                         fileUrls: fileUrls,
                         senderName: senderName,
+                        hasAvatar: hasAvatar,
                     });
                 });
 
